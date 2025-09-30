@@ -1,0 +1,7 @@
+MAVEN_ERE/
+MAVEN_ERE_with_fact_interp/
+group_split/
+*.pkl
+*.json
+*.ckpt
+__pycache__/
