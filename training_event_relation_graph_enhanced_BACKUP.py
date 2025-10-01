@@ -1438,41 +1438,6 @@ test_file_names = os.listdir(test_path)
 test_file_paths = []
 test_file_paths = create_file_path(test_path, test_file_names)
 
-# ========== USE 10% OF DATA ==========
-import random
-random.seed(42)
-
-train_sample_size = int(len(train_file_paths) * 0.10)
-dev_sample_size = int(len(dev_file_paths) * 0.10)
-test_sample_size = int(len(test_file_paths) * 0.10) if len(test_file_paths) > 0 else 0
-
-train_file_paths = random.sample(train_file_paths, train_sample_size)
-dev_file_paths = random.sample(dev_file_paths, dev_sample_size)
-test_file_paths = random.sample(test_file_paths, test_sample_size) if test_sample_size > 0 else []
-
-print(f"\n{'='*60}")
-print(f"USING 10% OF DATA")
-print(f"{'='*60}")
-print(f"Train: {len(train_file_paths)} files")
-print(f"Dev: {len(dev_file_paths)} files")
-print(f"Test: {len(test_file_paths)} files")
-print(f"{'='*60}\n")
-
-# Filter corrupted test files
-valid_test = []
-for p in test_file_paths:
-    try:
-        import json
-        with open(p) as f:
-            json.load(f)
-        valid_test.append(p)
-    except:
-        pass
-test_file_paths = valid_test
-print(f"Valid test files: {len(test_file_paths)}\n")
-# ========== END 10% SAMPLING ==========
-
-
 train_dataset = custom_dataset(train_file_paths)
 dev_dataset = custom_dataset(dev_file_paths)
 test_dataset = custom_dataset(test_file_paths)
