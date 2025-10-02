@@ -1,11 +1,8 @@
+
 import random
 import json
 import os
 
-# Create output directories
-os.makedirs("./MAVEN_ERE/train/", exist_ok=True)
-os.makedirs("./MAVEN_ERE/dev/", exist_ok=True)
-os.makedirs("./MAVEN_ERE/test/", exist_ok=True)
 
 
 ''' extract event labels and event relations labels from original json data'''
@@ -16,37 +13,6 @@ def extract_label(line_json, out_path):
     article_json['article_id'] = line_json['id']
     article_json['title'] = line_json['title']
     article_json['article_txt'] = " ".join(line_json['sentences'])
-
-    # Handle different input formats
-    if 'events' in line_json:
-        # Train/dev format - has 'events' array
-        source_events = line_json['events']
-    elif 'event_mentions' in line_json:
-        # Test format - already has event_mentions, create compatible 'events' structure
-        source_events = []
-        # Group event_mentions by their id to create events structure
-        events_dict = {}
-        for mention in line_json['event_mentions']:
-            # In test format, each mention might be standalone or need grouping
-            # Extract event_id from mention id (usually the mention id itself for test)
-            event_id = mention.get('id', mention.get('mention_id', ''))
-            if event_id not in events_dict:
-                events_dict[event_id] = {
-                    'id': event_id,
-                    'type': mention.get('type', 'Unknown'),
-                    'type_id': mention.get('type_id', 0),
-                    'mention': []
-                }
-            events_dict[event_id]['mention'].append({
-                'id': mention.get('id', mention.get('mention_id', '')),
-                'trigger_word': mention['trigger_word'],
-                'sent_id': mention['sent_id'],
-                'offset': mention['offset']
-            })
-        source_events = list(events_dict.values())
-    else:
-        print(f"ERROR: No 'events' or 'event_mentions' key in {line_json.get('id', 'unknown')}")
-        return
 
     # tokens_list
 
@@ -65,15 +31,15 @@ def extract_label(line_json, out_path):
     # event_mentions, list of dict with keys: event_id, mention_id, trigger_word, index_in_tokens_list, index_in_event_label
 
     article_json['event_mentions'] = []
-    for event_i in range(len(source_events)):
-        for mention_i in range(len(source_events[event_i]['mention'])):
+    for event_i in range(len(line_json['events'])):
+        for mention_i in range(len(line_json['events'][event_i]['mention'])):
             event_dict = {}
-            event_dict['event_id'] = source_events[event_i]['id']
-            event_dict['mention_id'] = source_events[event_i]['mention'][mention_i]['id']
-            event_dict['trigger_word'] = source_events[event_i]['mention'][mention_i]['trigger_word']
+            event_dict['event_id'] = line_json['events'][event_i]['id']
+            event_dict['mention_id'] = line_json['events'][event_i]['mention'][mention_i]['id']
+            event_dict['trigger_word'] = line_json['events'][event_i]['mention'][mention_i]['trigger_word']
             index_in_tokens_list = []
-            for token_i in range(source_events[event_i]['mention'][mention_i]['offset'][0], source_events[event_i]['mention'][mention_i]['offset'][1]):
-                index_in_tokens_list.append(prefix_sum_num_tokens[source_events[event_i]['mention'][mention_i]['sent_id']] + token_i)
+            for token_i in range(line_json['events'][event_i]['mention'][mention_i]['offset'][0], line_json['events'][event_i]['mention'][mention_i]['offset'][1]):
+                index_in_tokens_list.append(prefix_sum_num_tokens[line_json['events'][event_i]['mention'][mention_i]['sent_id']] + token_i)
 
             trigger_word = []
             for i in range(len(index_in_tokens_list)):
@@ -153,12 +119,10 @@ def extract_label(line_json, out_path):
         print("wrong number of event pairs")
 
 
-    # temporal relation - handle both formats
-    temporal_relations = line_json.get('temporal_relations', {})
-    
-    for relation_i in range(len(temporal_relations.get('BEFORE', []))):
-        relation_1 = temporal_relations['BEFORE'][relation_i][0] # event_id
-        relation_2 = temporal_relations['BEFORE'][relation_i][1]
+    # temporal relation
+    for relation_i in range(len(line_json['temporal_relations']['BEFORE'])):
+        relation_1 = line_json['temporal_relations']['BEFORE'][relation_i][0] # event_id
+        relation_2 = line_json['temporal_relations']['BEFORE'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -167,10 +131,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -198,9 +162,9 @@ def extract_label(line_json, out_path):
 
 
 
-    for relation_i in range(len(temporal_relations.get('OVERLAP', []))):
-        relation_1 = temporal_relations['OVERLAP'][relation_i][0] # event_id
-        relation_2 = temporal_relations['OVERLAP'][relation_i][1]
+    for relation_i in range(len(line_json['temporal_relations']['OVERLAP'])):
+        relation_1 = line_json['temporal_relations']['OVERLAP'][relation_i][0] # event_id
+        relation_2 = line_json['temporal_relations']['OVERLAP'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -209,10 +173,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -240,9 +204,9 @@ def extract_label(line_json, out_path):
 
 
 
-    for relation_i in range(len(temporal_relations.get('CONTAINS', []))):
-        relation_1 = temporal_relations['CONTAINS'][relation_i][0] # event_id
-        relation_2 = temporal_relations['CONTAINS'][relation_i][1]
+    for relation_i in range(len(line_json['temporal_relations']['CONTAINS'])):
+        relation_1 = line_json['temporal_relations']['CONTAINS'][relation_i][0] # event_id
+        relation_2 = line_json['temporal_relations']['CONTAINS'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -251,10 +215,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -282,9 +246,9 @@ def extract_label(line_json, out_path):
 
 
 
-    for relation_i in range(len(temporal_relations.get('SIMULTANEOUS', []))):
-        relation_1 = temporal_relations['SIMULTANEOUS'][relation_i][0] # event_id
-        relation_2 = temporal_relations['SIMULTANEOUS'][relation_i][1]
+    for relation_i in range(len(line_json['temporal_relations']['SIMULTANEOUS'])):
+        relation_1 = line_json['temporal_relations']['SIMULTANEOUS'][relation_i][0] # event_id
+        relation_2 = line_json['temporal_relations']['SIMULTANEOUS'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -293,10 +257,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -324,9 +288,9 @@ def extract_label(line_json, out_path):
 
 
 
-    for relation_i in range(len(temporal_relations.get('ENDS-ON', []))):
-        relation_1 = temporal_relations['ENDS-ON'][relation_i][0] # event_id
-        relation_2 = temporal_relations['ENDS-ON'][relation_i][1]
+    for relation_i in range(len(line_json['temporal_relations']['ENDS-ON'])):
+        relation_1 = line_json['temporal_relations']['ENDS-ON'][relation_i][0] # event_id
+        relation_2 = line_json['temporal_relations']['ENDS-ON'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -335,10 +299,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -366,9 +330,9 @@ def extract_label(line_json, out_path):
 
 
 
-    for relation_i in range(len(temporal_relations.get('BEGINS-ON', []))):
-        relation_1 = temporal_relations['BEGINS-ON'][relation_i][0] # event_id
-        relation_2 = temporal_relations['BEGINS-ON'][relation_i][1]
+    for relation_i in range(len(line_json['temporal_relations']['BEGINS-ON'])):
+        relation_1 = line_json['temporal_relations']['BEGINS-ON'][relation_i][0] # event_id
+        relation_2 = line_json['temporal_relations']['BEGINS-ON'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -377,10 +341,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -408,12 +372,10 @@ def extract_label(line_json, out_path):
 
 
 
-    # causal relation - handle both formats
-    causal_relations = line_json.get('causal_relations', {})
-    
-    for relation_i in range(len(causal_relations.get('CAUSE', []))):
-        relation_1 = causal_relations['CAUSE'][relation_i][0] # event_id
-        relation_2 = causal_relations['CAUSE'][relation_i][1]
+    # causal relation
+    for relation_i in range(len(line_json['causal_relations']['CAUSE'])):
+        relation_1 = line_json['causal_relations']['CAUSE'][relation_i][0] # event_id
+        relation_2 = line_json['causal_relations']['CAUSE'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -422,10 +384,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -453,9 +415,9 @@ def extract_label(line_json, out_path):
 
 
 
-    for relation_i in range(len(causal_relations.get('PRECONDITION', []))):
-        relation_1 = causal_relations['PRECONDITION'][relation_i][0] # event_id
-        relation_2 = causal_relations['PRECONDITION'][relation_i][1]
+    for relation_i in range(len(line_json['causal_relations']['PRECONDITION'])):
+        relation_1 = line_json['causal_relations']['PRECONDITION'][relation_i][0] # event_id
+        relation_2 = line_json['causal_relations']['PRECONDITION'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -464,10 +426,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -496,12 +458,10 @@ def extract_label(line_json, out_path):
 
 
 
-    # subevent relations - handle both formats
-    subevent_relations = line_json.get('subevent_relations', [])
-    
-    for relation_i in range(len(subevent_relations)):
-        relation_1 = subevent_relations[relation_i][0] # event_id
-        relation_2 = subevent_relations[relation_i][1]
+    # subevent relations
+    for relation_i in range(len(line_json['subevent_relations'])):
+        relation_1 = line_json['subevent_relations'][relation_i][0] # event_id
+        relation_2 = line_json['subevent_relations'][relation_i][1]
 
         if relation_1[:5] == 'EVENT' and relation_2[:5] == 'EVENT': # exclude relation between Time expressions
 
@@ -510,10 +470,10 @@ def extract_label(line_json, out_path):
             relation_2_event = []
             relation_2_index_in_event_mentions = []
             for event_i in range(len(article_json['event_mentions'])):
-                if article_json['event_mentions'][event_i]['event_id'] == relation_1 or article_json['event_mentions'][event_i]['mention_id'] == relation_1:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_1:
                     relation_1_event.append(article_json['event_mentions'][event_i])
                     relation_1_index_in_event_mentions.append(event_i)
-                if article_json['event_mentions'][event_i]['event_id'] == relation_2 or article_json['event_mentions'][event_i]['mention_id'] == relation_2:
+                if article_json['event_mentions'][event_i]['event_id'] == relation_2:
                     relation_2_event.append(article_json['event_mentions'][event_i])
                     relation_2_index_in_event_mentions.append(event_i)
 
@@ -550,7 +510,7 @@ def extract_label(line_json, out_path):
 
 ''' write json with event label and event relation label into new json file '''
 
-print("Processing dev split (valid.jsonl)...")
+
 line_id = 0
 with open("./MAVEN_ERE/valid.jsonl", "r") as f:
     while line_id < 710:
@@ -559,53 +519,22 @@ with open("./MAVEN_ERE/valid.jsonl", "r") as f:
         out_path = "./MAVEN_ERE/dev/" + line_json['id'] + ".json"
         extract_label(line_json, out_path)
         line_id += 1
-print(f"Processed {line_id} dev files")
 
 
-print("\nProcessing train split (train.jsonl)...")
 line_id = 0
 with open("./MAVEN_ERE/train.jsonl", "r") as f:
     while line_id < 2913:
-        if line_id % 500 == 0:
-            print(f"  Processed {line_id}/2913 train files...")
+        print(line_id)
         line = f.readline()
         line_json = json.loads(line)
         out_path = "./MAVEN_ERE/train/" + line_json['id'] + ".json"
         extract_label(line_json, out_path)
         line_id += 1
-print(f"Processed {line_id} train files")
 
 
-print("\nProcessing test split (test.jsonl)...")
-if os.path.exists("./MAVEN_ERE/test.jsonl"):
-    line_id = 0
-    error_count = 0
-    with open("./MAVEN_ERE/test.jsonl", "r") as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                if not line.strip():  # Skip empty lines
-                    continue
-                line_json = json.loads(line)
-                out_path = "./MAVEN_ERE/test/" + line_json['id'] + ".json"
-                extract_label(line_json, out_path)
-                line_id += 1
-                if line_id % 100 == 0:
-                    print(f"  Processed {line_id} test files...")
-            except Exception as e:
-                error_count += 1
-                print(f"  Line {line_num}: {type(e).__name__}: {str(e)[:100]}, skipping...")
-                continue
-    
-    print(f"Processed {line_id} test files" + (f" ({error_count} errors skipped)" if error_count > 0 else ""))
-else:
-    print("test.jsonl not found - test split will remain empty")
 
-print("\n" + "="*50)
-print("PROCESSING COMPLETE")
-print("="*50)
-print(f"Train files: ./MAVEN_ERE/train/")
-print(f"Dev files: ./MAVEN_ERE/dev/")
-print(f"Test files: ./MAVEN_ERE/test/")
+
+
 
 
 # stop here

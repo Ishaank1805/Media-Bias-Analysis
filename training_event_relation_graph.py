@@ -28,11 +28,10 @@ import sklearn
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.metrics import accuracy_score
-from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
+from torch.optim import AdamW
 from collections import Counter
 from scipy.optimize import linear_sum_assignment
-import pickle
 
 
 
@@ -56,7 +55,6 @@ causal_weight_cause = 1
 causal_weight_caused = 1
 subevent_weight_contain = 1
 subevent_weight_contained = 1
-fact_interp_weight_interpretive = 1  # New weight for factual/interpretive task
 
 no_decay = ['bias', 'LayerNorm.weight']
 longformer_weight_decay = 1e-2
@@ -90,15 +88,6 @@ tokenizer = LongformerTokenizer.from_pretrained('allenai/longformer-base-4096')
 class custom_dataset(Dataset):
     def __init__(self, file_paths):
         self.file_paths = file_paths
-        # Load factual/interpretive labels cache
-        self.fact_interp_cache = {}
-        
-        # Try to load cached labels for faster loading
-        for split_name in ['train', 'dev']:
-            cache_file = f'./fact_interp_labels_{split_name}.pkl'
-            if os.path.exists(cache_file):
-                with open(cache_file, 'rb') as f:
-                    self.fact_interp_cache.update(pickle.load(f))
 
     def __len__(self):
         return len(self.file_paths)
@@ -184,36 +173,11 @@ class custom_dataset(Dataset):
         label_temporal = torch.tensor(label_temporal)
         label_causal = torch.tensor(label_causal)
         label_subevent = torch.tensor(label_subevent)
-        
-        
-        # Extract factual/interpretive labels for events
-        label_fact_interp = []
-        filename = os.path.basename(file_path)
-        
-        if filename in self.fact_interp_cache:
-            fact_interp_labels = self.fact_interp_cache[filename]
-            for i, event_label in enumerate(article_json['event_label']):
-                if event_label['event_label'] == 1:  # Is an event
-                    if i < len(fact_interp_labels) and fact_interp_labels[i] != -1:
-                        label_fact_interp.append(fact_interp_labels[i])
-                    else:
-                        label_fact_interp.append(0)  # Default factual
-        else:
-            # If no cache available, extract from JSON if available
-            for i, event_label in enumerate(article_json['event_label']):
-                if event_label['event_label'] == 1:  # Is an event
-                    if 'fact_interp_label' in event_label:
-                        label_fact_interp.append(event_label['fact_interp_label'])
-                    else:
-                        label_fact_interp.append(0)  # Default factual
-        
-        label_fact_interp = torch.tensor(label_fact_interp)
 
 
         dict = {"input_ids": input_ids, "attention_mask": attention_mask,
                 "label_event": label_event, "event_pairs": event_pairs, "label_coreference": label_coreference,
-                "label_temporal": label_temporal, "label_causal": label_causal, "label_subevent": label_subevent,
-                "label_fact_interp": label_fact_interp}
+                "label_temporal": label_temporal, "label_causal": label_causal, "label_subevent": label_subevent}
 
         return dict
 
@@ -312,17 +276,6 @@ class Event_Relation_Graph(nn.Module):
         self.event_head_2 = nn.Linear(768, 2, bias=True)
         nn.init.xavier_uniform_(self.event_head_2.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.event_head_2.bias)
-        
-        
-        # Factual/Interpretive classification head
-        self.fact_interp_head_1 = nn.Linear(768, 384, bias=True)
-        nn.init.xavier_uniform_(self.fact_interp_head_1.weight, gain=nn.init.calculate_gain('relu'))
-        nn.init.zeros_(self.fact_interp_head_1.bias)
-        
-        self.fact_interp_head_2 = nn.Linear(384, 2, bias=True)
-        nn.init.xavier_uniform_(self.fact_interp_head_2.weight, gain=nn.init.calculate_gain('relu'))
-        nn.init.zeros_(self.fact_interp_head_2.bias)
-        
 
         if coreference_train_method == "event_pairs":
 
@@ -397,7 +350,7 @@ class Event_Relation_Graph(nn.Module):
 
 
 
-    def forward(self, input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp, coreference_train_method):
+    def forward(self, input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, coreference_train_method):
 
         token_embeddings = self.token_embedding(input_ids, attention_mask) # number of tokens * 768
 
@@ -435,32 +388,6 @@ class Event_Relation_Graph(nn.Module):
 
         event_weighted_loss = torch.add(event_loss_0, event_loss_1)
         event_weighted_loss = torch.sum(event_weighted_loss)
-        
-        
-        # Factual/Interpretive classification task
-        # Extract embeddings only for events (where label_event[:, 2] == 1)
-        event_indices = (label_event[:, 2] == 1).nonzero(as_tuple=True)[0]
-        if len(event_indices) > 0 and len(label_fact_interp) > 0:
-            event_only_embeddings = event_embeddings[event_indices]
-            
-            fact_interp_scores = self.fact_interp_head_2(
-                self.relu(self.fact_interp_head_1(event_only_embeddings))
-            )
-            fact_interp_loss = self.crossentropyloss(fact_interp_scores, label_fact_interp)
-            
-            # Weight for class imbalance
-            fact_interp_loss_weight_0 = (label_fact_interp == 0).int()  # weight = 1 for factual
-            fact_interp_loss_0 = torch.mul(fact_interp_loss, fact_interp_loss_weight_0)
-            
-            fact_interp_loss_weight_1 = torch.mul((label_fact_interp == 1).int(), fact_interp_weight_interpretive)
-            fact_interp_loss_1 = torch.mul(fact_interp_loss, fact_interp_loss_weight_1)
-            
-            fact_interp_weighted_loss = torch.add(fact_interp_loss_0, fact_interp_loss_1)
-            fact_interp_weighted_loss = torch.sum(fact_interp_weighted_loss)
-        else:
-            # No events or no labels, set loss to 0
-            fact_interp_weighted_loss = torch.tensor(0.0).cuda()
-            fact_interp_scores = None
 
 
         # convert label_coreference into label_coreference_cluster
@@ -698,13 +625,11 @@ class Event_Relation_Graph(nn.Module):
 
         if coreference_train_method == "event_pairs":
             return event_weighted_loss, event_raw_scores, temporal_weighted_loss, temporal_raw_scores, causal_weighted_loss, causal_raw_scores, \
-                   subevent_weighted_loss, subevent_raw_scores, coreference_weighted_loss, coreference_raw_scores, predicted_coreference_cluster, label_coreference_cluster, \
-                   fact_interp_weighted_loss, fact_interp_scores
+                   subevent_weighted_loss, subevent_raw_scores, coreference_weighted_loss, coreference_raw_scores, predicted_coreference_cluster, label_coreference_cluster
 
         if coreference_train_method == "event_cluster":
             return event_weighted_loss, event_raw_scores, temporal_weighted_loss, temporal_raw_scores, causal_weighted_loss, causal_raw_scores, \
-                   subevent_weighted_loss, subevent_raw_scores, coreference_cluster_loss, coreference_probs, label_coreference_cluster, \
-                   fact_interp_weighted_loss, fact_interp_scores
+                   subevent_weighted_loss, subevent_raw_scores, coreference_cluster_loss, coreference_probs, label_coreference_cluster
 
 
 
@@ -966,7 +891,6 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
             label_temporal = batch['label_temporal']
             label_causal = batch['label_causal']
             label_subevent = batch['label_subevent']
-            label_fact_interp = batch['label_fact_interp']
 
             label_event = label_event[0, :, :]
             number_of_events = torch.sum((label_event[:, 2] == 1).int())
@@ -977,17 +901,15 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
             label_temporal = label_temporal[0, :]
             label_causal = label_causal[0, :]
             label_subevent = label_subevent[0, :]
-            label_fact_interp = label_fact_interp[0, :]
 
-            input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp = \
+            input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent = \
                 input_ids.to(device), attention_mask.to(device), label_event.to(device), event_pairs.to(device), \
-                label_coreference.to(device), label_temporal.to(device), label_causal.to(device), label_subevent.to(device), label_fact_interp.to(device)
+                label_coreference.to(device), label_temporal.to(device), label_causal.to(device), label_subevent.to(device)
 
             with torch.no_grad():
                 event_weighted_loss, event_raw_scores, temporal_weighted_loss, temporal_raw_scores, causal_weighted_loss, causal_raw_scores, \
-                subevent_weighted_loss, subevent_raw_scores, coreference_weighted_loss, coreference_raw_scores, predicted_coreference_cluster, label_coreference_cluster, \
-                fact_interp_weighted_loss, fact_interp_scores = \
-                    event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp, coreference_train_method)
+                subevent_weighted_loss, subevent_raw_scores, coreference_weighted_loss, coreference_raw_scores, predicted_coreference_cluster, label_coreference_cluster = \
+                    event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, coreference_train_method)
 
 
             gold_event2cluster = get_event2cluster(label_coreference_cluster)
@@ -1056,23 +978,6 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
                 true_label_coreference_onetest = torch.cat((true_label_coreference_onetest, true_label_coreference), dim=0)
 
 
-            # Factual/Interpretive evaluation
-            if fact_interp_scores is not None and len(label_fact_interp) > 0:
-                decision_fact_interp = torch.argmax(fact_interp_scores, dim=1).view(fact_interp_scores.shape[0], 1)
-                true_label_fact_interp = label_fact_interp.view(fact_interp_scores.shape[0], 1)
-                
-                if step == 0:
-                    decision_fact_interp_onetest = decision_fact_interp
-                    true_label_fact_interp_onetest = true_label_fact_interp
-                else:
-                    if 'decision_fact_interp_onetest' in locals():
-                        decision_fact_interp_onetest = torch.cat((decision_fact_interp_onetest, decision_fact_interp), dim=0)
-                        true_label_fact_interp_onetest = torch.cat((true_label_fact_interp_onetest, true_label_fact_interp), dim=0)
-                    else:
-                        decision_fact_interp_onetest = decision_fact_interp
-                        true_label_fact_interp_onetest = true_label_fact_interp
-
-
 
         decision_event_onetest = decision_event_onetest.to('cpu').numpy()
         true_label_event_onetest = true_label_event_onetest.to('cpu').numpy()
@@ -1129,21 +1034,6 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
         macro_F_coreference = precision_recall_fscore_support(true_label_coreference_onetest, decision_coreference_onetest, average='macro')[2]
 
 
-        # Factual/Interpretive evaluation
-        if 'decision_fact_interp_onetest' in locals():
-            decision_fact_interp_onetest = decision_fact_interp_onetest.to('cpu').numpy()
-            true_label_fact_interp_onetest = true_label_fact_interp_onetest.to('cpu').numpy()
-            
-            if verbose:
-                print("======== Factual/Interpretive Classification Task ========")
-                print("Macro: ", precision_recall_fscore_support(true_label_fact_interp_onetest, decision_fact_interp_onetest, average='macro'))
-                print("None: ", precision_recall_fscore_support(true_label_fact_interp_onetest, decision_fact_interp_onetest, average=None)[:3])
-            
-            macro_F_fact_interp = precision_recall_fscore_support(true_label_fact_interp_onetest, decision_fact_interp_onetest, average='macro')[2]
-        else:
-            macro_F_fact_interp = 0.0
-
-
         muc_precision, muc_recall, muc_F = muc_evaluator.get_prf()
         bcubed_precision, bcubed_recall, bcubed_F = bcubed_evaluator.get_prf()
         ceafe_precision, ceafe_recall, ceafe_F = ceafe_evaluator.get_prf()
@@ -1158,13 +1048,13 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
             print('BLANC precision: {:.3f}, BLANC recall: {:.3f}, BLANC F: {:.3f}'.format(blanc_precision, blanc_recall, blanc_F))
 
 
-        macro_F_graph = (macro_F_event + macro_F_temporal + macro_F_causal + macro_F_subevent + conll_F_coreference + macro_F_fact_interp) / 6
+        macro_F_graph = (macro_F_event + macro_F_temporal + macro_F_causal + macro_F_subevent + conll_F_coreference) / 5
 
         if verbose:
             print('macro_F_graph: {:.3f}'.format(macro_F_graph))
 
 
-        return macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph
+        return macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph
 
 
 
@@ -1186,7 +1076,6 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
             label_temporal = batch['label_temporal']
             label_causal = batch['label_causal']
             label_subevent = batch['label_subevent']
-            label_fact_interp = batch['label_fact_interp']
 
             label_event = label_event[0, :, :]
             number_of_events = torch.sum((label_event[:, 2] == 1).int())
@@ -1197,17 +1086,15 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
             label_temporal = label_temporal[0, :]
             label_causal = label_causal[0, :]
             label_subevent = label_subevent[0, :]
-            label_fact_interp = label_fact_interp[0, :]
 
-            input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp = \
+            input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent = \
                 input_ids.to(device), attention_mask.to(device), label_event.to(device), event_pairs.to(device), \
-                label_coreference.to(device), label_temporal.to(device), label_causal.to(device), label_subevent.to(device), label_fact_interp.to(device)
+                label_coreference.to(device), label_temporal.to(device), label_causal.to(device), label_subevent.to(device)
 
             with torch.no_grad():
                 event_weighted_loss, event_raw_scores, temporal_weighted_loss, temporal_raw_scores, causal_weighted_loss, causal_raw_scores, \
-                subevent_weighted_loss, subevent_raw_scores, coreference_cluster_loss, coreference_probs, label_coreference_cluster, \
-                fact_interp_weighted_loss, fact_interp_scores = \
-                    event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp, coreference_train_method)
+                subevent_weighted_loss, subevent_raw_scores, coreference_cluster_loss, coreference_probs, label_coreference_cluster = \
+                    event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, coreference_train_method)
 
 
             pred_cluster, pred_event2cluster = get_predicted_clusters(coreference_probs)
@@ -1264,23 +1151,6 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
                 true_label_subevent_onetest = torch.cat((true_label_subevent_onetest, true_label_subevent), dim=0)
 
 
-            # Factual/Interpretive evaluation
-            if fact_interp_scores is not None and len(label_fact_interp) > 0:
-                decision_fact_interp = torch.argmax(fact_interp_scores, dim=1).view(fact_interp_scores.shape[0], 1)
-                true_label_fact_interp = label_fact_interp.view(fact_interp_scores.shape[0], 1)
-                
-                if step == 0:
-                    decision_fact_interp_onetest = decision_fact_interp
-                    true_label_fact_interp_onetest = true_label_fact_interp
-                else:
-                    if 'decision_fact_interp_onetest' in locals():
-                        decision_fact_interp_onetest = torch.cat((decision_fact_interp_onetest, decision_fact_interp), dim=0)
-                        true_label_fact_interp_onetest = torch.cat((true_label_fact_interp_onetest, true_label_fact_interp), dim=0)
-                    else:
-                        decision_fact_interp_onetest = decision_fact_interp
-                        true_label_fact_interp_onetest = true_label_fact_interp
-
-
 
         decision_event_onetest = decision_event_onetest.to('cpu').numpy()
         true_label_event_onetest = true_label_event_onetest.to('cpu').numpy()
@@ -1326,21 +1196,6 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
         macro_F_subevent = precision_recall_fscore_support(true_label_subevent_onetest, decision_subevent_onetest, average='macro')[2]
 
 
-        # Factual/Interpretive evaluation
-        if 'decision_fact_interp_onetest' in locals():
-            decision_fact_interp_onetest = decision_fact_interp_onetest.to('cpu').numpy()
-            true_label_fact_interp_onetest = true_label_fact_interp_onetest.to('cpu').numpy()
-            
-            if verbose:
-                print("======== Factual/Interpretive Classification Task ========")
-                print("Macro: ", precision_recall_fscore_support(true_label_fact_interp_onetest, decision_fact_interp_onetest, average='macro'))
-                print("None: ", precision_recall_fscore_support(true_label_fact_interp_onetest, decision_fact_interp_onetest, average=None)[:3])
-            
-            macro_F_fact_interp = precision_recall_fscore_support(true_label_fact_interp_onetest, decision_fact_interp_onetest, average='macro')[2]
-        else:
-            macro_F_fact_interp = 0.0
-
-
         muc_precision, muc_recall, muc_F = muc_evaluator.get_prf()
         bcubed_precision, bcubed_recall, bcubed_F = bcubed_evaluator.get_prf()
         ceafe_precision, ceafe_recall, ceafe_F = ceafe_evaluator.get_prf()
@@ -1355,13 +1210,13 @@ def evaluate(event_relation_graph, eval_dataloader, verbose):
             print('BLANC precision: {:.3f}, BLANC recall: {:.3f}, BLANC F: {:.3f}'.format(blanc_precision, blanc_recall, blanc_F))
 
 
-        macro_F_graph = (macro_F_event + macro_F_temporal + macro_F_causal + macro_F_subevent + conll_F_coreference + macro_F_fact_interp) / 6
+        macro_F_graph = (macro_F_event + macro_F_temporal + macro_F_causal + macro_F_subevent + conll_F_coreference) / 5
 
         if verbose:
             print('macro_F_graph: {:.3f}'.format(macro_F_graph))
 
 
-        return macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph
+        return macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph
 
 
 
@@ -1417,69 +1272,38 @@ optimizer_grouped_parameters = [
 optimizer = AdamW(optimizer_grouped_parameters, eps=1e-8)
 
 
-# Use the enhanced data if available, otherwise use original
-if os.path.exists("./MAVEN_ERE_with_fact_interp/train/"):
-    train_path = "./MAVEN_ERE_with_fact_interp/train/"
-    dev_path = "./MAVEN_ERE_with_fact_interp/dev/"
-else:
-    train_path = "./MAVEN_ERE/train/"
-    dev_path = "./MAVEN_ERE/dev/"
-
+train_path = "./MAVEN_ERE/train/"
 train_file_names = os.listdir(train_path)
+random.seed(42)
+train_file_names = random.sample(train_file_names, int(len(train_file_names) * 0.2))
 train_file_paths = []
 train_file_paths = create_file_path(train_path, train_file_names)
 
+dev_path = "./MAVEN_ERE/dev/"
 dev_file_names = os.listdir(dev_path)
+random.seed(42)
+dev_file_names = random.sample(dev_file_names, int(len(dev_file_names) * 0.2))
 dev_file_paths = []
 dev_file_paths = create_file_path(dev_path, dev_file_names)
 
-test_path = "./MAVEN_ERE/test/"
-test_file_names = os.listdir(test_path)
-test_file_paths = []
-test_file_paths = create_file_path(test_path, test_file_names)
+print(f"Training on {len(train_file_paths)} files (20% of dataset)")
+print(f"Validating on {len(dev_file_paths)} files (20% of dataset)")
 
-# ========== USE 10% OF DATA ==========
-import random
-random.seed(42)
-
-train_sample_size = int(len(train_file_paths) * 0.10)
-dev_sample_size = int(len(dev_file_paths) * 0.10)
-test_sample_size = int(len(test_file_paths) * 0.10) if len(test_file_paths) > 0 else 0
-
-train_file_paths = random.sample(train_file_paths, train_sample_size)
-dev_file_paths = random.sample(dev_file_paths, dev_sample_size)
-test_file_paths = random.sample(test_file_paths, test_sample_size) if test_sample_size > 0 else []
-
-print(f"\n{'='*60}")
-print(f"USING 10% OF DATA")
-print(f"{'='*60}")
-print(f"Train: {len(train_file_paths)} files")
-print(f"Dev: {len(dev_file_paths)} files")
-print(f"Test: {len(test_file_paths)} files")
-print(f"{'='*60}\n")
-
-# Filter corrupted test files
-valid_test = []
-for p in test_file_paths:
-    try:
-        import json
-        with open(p) as f:
-            json.load(f)
-        valid_test.append(p)
-    except:
-        pass
-test_file_paths = valid_test
-print(f"Valid test files: {len(test_file_paths)}\n")
-# ========== END 10% SAMPLING ==========
-
+# COMMENTED OUT: test set loading
+# test_path = "./MAVEN_ERE/test/"
+# test_file_names = os.listdir(test_path)
+# test_file_paths = []
+# test_file_paths = create_file_path(test_path, test_file_names)
 
 train_dataset = custom_dataset(train_file_paths)
 dev_dataset = custom_dataset(dev_file_paths)
-test_dataset = custom_dataset(test_file_paths)
+# COMMENTED OUT: test dataset
+# test_dataset = custom_dataset(test_file_paths)
 
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+# COMMENTED OUT: test dataloader
+# test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 
 num_train_steps = num_epochs * len(train_dataloader)
@@ -1493,7 +1317,6 @@ best_conll_F_coreference = 0 # average of MUC, B_cube, CEAF_e, blanc F1 scores
 best_macro_F_temporal = 0
 best_macro_F_causal = 0
 best_macro_F_subevent = 0
-best_macro_F_fact_interp = 0  # New metric
 best_macro_F_graph = 0
 
 
@@ -1510,7 +1333,6 @@ for epoch_i in range(num_epochs):
     total_temporal_loss = 0
     total_causal_loss = 0
     total_subevent_loss = 0
-    total_fact_interp_loss = 0  # New loss tracking
     num_batch = 0
 
     for step, batch in enumerate(train_dataloader):
@@ -1525,14 +1347,12 @@ for epoch_i in range(num_epochs):
                 avg_temporal_loss = total_temporal_loss / num_batch
                 avg_causal_loss = total_causal_loss / num_batch
                 avg_subevent_loss = total_subevent_loss / num_batch
-                avg_fact_interp_loss = total_fact_interp_loss / num_batch
 
                 print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Event Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_event_loss))
                 print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Coreference Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_coreference_loss))
                 print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Temporal Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_temporal_loss))
                 print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Causal Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_causal_loss))
                 print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Subevent Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_subevent_loss))
-                print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Fact/Interp Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_fact_interp_loss))
 
             else:
                 print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.'.format(step, len(train_dataloader), elapsed))
@@ -1542,13 +1362,12 @@ for epoch_i in range(num_epochs):
             total_temporal_loss = 0
             total_causal_loss = 0
             total_subevent_loss = 0
-            total_fact_interp_loss = 0
             num_batch = 0
 
             # evaluate on dev set
 
             if coreference_train_method == "event_pairs":
-                macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
+                macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
                     evaluate(event_relation_graph, dev_dataloader, verbose = 1)
 
                 if macro_F_coreference > best_macro_F_coreference:
@@ -1556,7 +1375,7 @@ for epoch_i in range(num_epochs):
                     best_macro_F_coreference = macro_F_coreference
 
             if coreference_train_method == "event_cluster":
-                macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
+                macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
                     evaluate(event_relation_graph, dev_dataloader, verbose = 1)
 
             if macro_F_event > best_macro_F_event:
@@ -1574,9 +1393,6 @@ for epoch_i in range(num_epochs):
             if conll_F_coreference > best_conll_F_coreference:
                 torch.save(event_relation_graph.state_dict(),'./saved_models/event_relation_graph/best_conll_F_coreference.ckpt')
                 best_conll_F_coreference = conll_F_coreference
-            if macro_F_fact_interp > best_macro_F_fact_interp:
-                torch.save(event_relation_graph.state_dict(),'./saved_models/event_relation_graph/best_macro_F_fact_interp.ckpt')
-                best_macro_F_fact_interp = macro_F_fact_interp
             if macro_F_graph > best_macro_F_graph:
                 torch.save(event_relation_graph.state_dict(),'./saved_models/event_relation_graph/best_macro_F_graph.ckpt')
                 best_macro_F_graph = macro_F_graph
@@ -1596,7 +1412,6 @@ for epoch_i in range(num_epochs):
         label_temporal = batch['label_temporal']
         label_causal = batch['label_causal']
         label_subevent = batch['label_subevent']
-        label_fact_interp = batch['label_fact_interp']
 
         label_event = label_event[0, :, :]
         number_of_events = torch.sum((label_event[:, 2] == 1).int())
@@ -1607,11 +1422,10 @@ for epoch_i in range(num_epochs):
         label_temporal = label_temporal[0, :]
         label_causal = label_causal[0, :]
         label_subevent = label_subevent[0, :]
-        label_fact_interp = label_fact_interp[0, :]
 
-        input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp = \
+        input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent = \
             input_ids.to(device), attention_mask.to(device), label_event.to(device), event_pairs.to(device), \
-            label_coreference.to(device), label_temporal.to(device), label_causal.to(device), label_subevent.to(device), label_fact_interp.to(device)
+            label_coreference.to(device), label_temporal.to(device), label_causal.to(device), label_subevent.to(device)
 
         optimizer.zero_grad()
 
@@ -1619,24 +1433,21 @@ for epoch_i in range(num_epochs):
         if coreference_train_method == "event_pairs":
 
             event_weighted_loss, event_raw_scores, temporal_weighted_loss, temporal_raw_scores, causal_weighted_loss, causal_raw_scores, \
-            subevent_weighted_loss, subevent_raw_scores, coreference_weighted_loss, coreference_raw_scores, predicted_coreference_cluster, label_coreference_cluster, \
-            fact_interp_weighted_loss, fact_interp_scores = \
-                event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp, coreference_train_method)
+            subevent_weighted_loss, subevent_raw_scores, coreference_weighted_loss, coreference_raw_scores, predicted_coreference_cluster, label_coreference_cluster = \
+                event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, coreference_train_method)
 
             total_event_loss += event_weighted_loss.item()
             total_coreference_loss += coreference_weighted_loss.item()
             total_temporal_loss += temporal_weighted_loss.item()
             total_causal_loss += causal_weighted_loss.item()
             total_subevent_loss += subevent_weighted_loss.item()
-            total_fact_interp_loss += fact_interp_weighted_loss.item()
             num_batch += 1
 
             event_weighted_loss.backward(retain_graph = True)
             coreference_weighted_loss.backward(retain_graph = True)
             temporal_weighted_loss.backward(retain_graph = True)
             causal_weighted_loss.backward(retain_graph = True)
-            subevent_weighted_loss.backward(retain_graph = True)
-            fact_interp_weighted_loss.backward()
+            subevent_weighted_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(event_relation_graph.parameters(), 1.0)
             optimizer.step()
@@ -1645,24 +1456,21 @@ for epoch_i in range(num_epochs):
         if coreference_train_method == "event_cluster":
 
             event_weighted_loss, event_raw_scores, temporal_weighted_loss, temporal_raw_scores, causal_weighted_loss, causal_raw_scores, \
-            subevent_weighted_loss, subevent_raw_scores, coreference_cluster_loss, coreference_probs, label_coreference_cluster, \
-            fact_interp_weighted_loss, fact_interp_scores = \
-                event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, label_fact_interp, coreference_train_method)
+            subevent_weighted_loss, subevent_raw_scores, coreference_cluster_loss, coreference_probs, label_coreference_cluster = \
+                event_relation_graph(input_ids, attention_mask, label_event, event_pairs, label_coreference, label_temporal, label_causal, label_subevent, coreference_train_method)
 
             total_event_loss += event_weighted_loss.item()
             total_coreference_loss += coreference_cluster_loss.item()
             total_temporal_loss += temporal_weighted_loss.item()
             total_causal_loss += causal_weighted_loss.item()
             total_subevent_loss += subevent_weighted_loss.item()
-            total_fact_interp_loss += fact_interp_weighted_loss.item()
             num_batch += 1
 
             event_weighted_loss.backward(retain_graph = True)
             coreference_cluster_loss.backward(retain_graph = True)
             temporal_weighted_loss.backward(retain_graph = True)
             causal_weighted_loss.backward(retain_graph = True)
-            subevent_weighted_loss.backward(retain_graph = True)
-            fact_interp_weighted_loss.backward()
+            subevent_weighted_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(event_relation_graph.parameters(), 1.0)
             optimizer.step()
@@ -1678,14 +1486,12 @@ for epoch_i in range(num_epochs):
         avg_temporal_loss = total_temporal_loss / num_batch
         avg_causal_loss = total_causal_loss / num_batch
         avg_subevent_loss = total_subevent_loss / num_batch
-        avg_fact_interp_loss = total_fact_interp_loss / num_batch
 
         print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Event Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_event_loss))
         print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Coreference Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_coreference_loss))
         print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Temporal Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_temporal_loss))
         print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Causal Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_causal_loss))
         print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Subevent Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_subevent_loss))
-        print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.    Fact/Interp Training Loss Average: {:.3f}'.format(step, len(train_dataloader), elapsed, avg_fact_interp_loss))
 
     else:
         print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.'.format(step, len(train_dataloader), elapsed))
@@ -1695,13 +1501,12 @@ for epoch_i in range(num_epochs):
     total_temporal_loss = 0
     total_causal_loss = 0
     total_subevent_loss = 0
-    total_fact_interp_loss = 0
     num_batch = 0
 
     # evaluate on dev set
 
     if coreference_train_method == "event_pairs":
-        macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
+        macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
             evaluate(event_relation_graph, dev_dataloader, verbose = 1)
 
         if macro_F_coreference > best_macro_F_coreference:
@@ -1709,7 +1514,7 @@ for epoch_i in range(num_epochs):
             best_macro_F_coreference = macro_F_coreference
 
     if coreference_train_method == "event_cluster":
-        macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
+        macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
             evaluate(event_relation_graph, dev_dataloader, verbose = 1)
 
     if macro_F_event > best_macro_F_event:
@@ -1727,136 +1532,129 @@ for epoch_i in range(num_epochs):
     if conll_F_coreference > best_conll_F_coreference:
         torch.save(event_relation_graph.state_dict(),'./saved_models/event_relation_graph/best_conll_F_coreference.ckpt')
         best_conll_F_coreference = conll_F_coreference
-    if macro_F_fact_interp > best_macro_F_fact_interp:
-        torch.save(event_relation_graph.state_dict(),'./saved_models/event_relation_graph/best_macro_F_fact_interp.ckpt')
-        best_macro_F_fact_interp = macro_F_fact_interp
     if macro_F_graph > best_macro_F_graph:
         torch.save(event_relation_graph.state_dict(),'./saved_models/event_relation_graph/best_macro_F_graph.ckpt')
         best_macro_F_graph = macro_F_graph
 
 
-
-
-# test
-
-print("Testing...")
-
-print("best_macro_F_graph on dev is: {:}".format(best_macro_F_graph))
-
-event_relation_graph = Event_Relation_Graph()
-event_relation_graph.cuda()
-event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_graph.ckpt', map_location=device))
-
+print("")
+print("Training complete!")
+print("Best scores on dev set:")
+print(f"  best_macro_F_event: {best_macro_F_event:.3f}")
+print(f"  best_macro_F_temporal: {best_macro_F_temporal:.3f}")
+print(f"  best_macro_F_causal: {best_macro_F_causal:.3f}")
+print(f"  best_macro_F_subevent: {best_macro_F_subevent:.3f}")
+print(f"  best_conll_F_coreference: {best_conll_F_coreference:.3f}")
 if coreference_train_method == "event_pairs":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-if coreference_train_method == "event_cluster":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
+    print(f"  best_macro_F_coreference: {best_macro_F_coreference:.3f}")
+print(f"  best_macro_F_graph: {best_macro_F_graph:.3f}")
 
 
-print("best_macro_F_event on dev is: {:}".format(best_macro_F_event))
-
-event_relation_graph = Event_Relation_Graph()
-event_relation_graph.cuda()
-event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_event.ckpt', map_location=device))
-
-if coreference_train_method == "event_pairs":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-if coreference_train_method == "event_cluster":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-
-print("best_macro_F_temporal on dev is: {:}".format(best_macro_F_temporal))
-
-event_relation_graph = Event_Relation_Graph()
-event_relation_graph.cuda()
-event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_temporal.ckpt', map_location=device))
-
-if coreference_train_method == "event_pairs":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-if coreference_train_method == "event_cluster":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-
-print("best_macro_F_causal on dev is: {:}".format(best_macro_F_causal))
-
-event_relation_graph = Event_Relation_Graph()
-event_relation_graph.cuda()
-event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_causal.ckpt', map_location=device))
-
-if coreference_train_method == "event_pairs":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-if coreference_train_method == "event_cluster":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-
-print("best_macro_F_subevent on dev is: {:}".format(best_macro_F_subevent))
-
-event_relation_graph = Event_Relation_Graph()
-event_relation_graph.cuda()
-event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_subevent.ckpt', map_location=device))
-
-if coreference_train_method == "event_pairs":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-if coreference_train_method == "event_cluster":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-
-print("best_conll_F_coreference on dev is: {:}".format(best_conll_F_coreference))
-
-event_relation_graph = Event_Relation_Graph()
-event_relation_graph.cuda()
-event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_conll_F_coreference.ckpt', map_location=device))
-
-if coreference_train_method == "event_pairs":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-if coreference_train_method == "event_cluster":
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-
-print("best_macro_F_fact_interp on dev is: {:}".format(best_macro_F_fact_interp))
-
-event_relation_graph = Event_Relation_Graph()
-event_relation_graph.cuda()
-if os.path.exists('./saved_models/event_relation_graph/best_macro_F_fact_interp.ckpt'):
-    event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_fact_interp.ckpt', map_location=device))
-    
-    if coreference_train_method == "event_pairs":
-        macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-            evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-    if coreference_train_method == "event_cluster":
-        macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-            evaluate(event_relation_graph, test_dataloader, verbose=1)
-
-
-if coreference_train_method == "event_pairs":
-
-    print("best_macro_F_coreference on dev is: {:}".format(best_macro_F_coreference))
-
-    event_relation_graph = Event_Relation_Graph()
-    event_relation_graph.cuda()
-    event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_coreference.ckpt', map_location=device))
-
-    macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_fact_interp, macro_F_graph = \
-        evaluate(event_relation_graph, test_dataloader, verbose=1)
+# COMMENTED OUT: ALL TEST SET EVALUATION
+# # test
+# 
+# print("Testing...")
+# 
+# print("best_macro_F_graph on dev is: {:}".format(best_macro_F_graph))
+# 
+# event_relation_graph = Event_Relation_Graph()
+# event_relation_graph.cuda()
+# event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_graph.ckpt', map_location=device))
+# 
+# if coreference_train_method == "event_pairs":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# if coreference_train_method == "event_cluster":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# 
+# print("best_macro_F_event on dev is: {:}".format(best_macro_F_event))
+# 
+# event_relation_graph = Event_Relation_Graph()
+# event_relation_graph.cuda()
+# event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_event.ckpt', map_location=device))
+# 
+# if coreference_train_method == "event_pairs":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# if coreference_train_method == "event_cluster":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# 
+# print("best_macro_F_temporal on dev is: {:}".format(best_macro_F_temporal))
+# 
+# event_relation_graph = Event_Relation_Graph()
+# event_relation_graph.cuda()
+# event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_temporal.ckpt', map_location=device))
+# 
+# if coreference_train_method == "event_pairs":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# if coreference_train_method == "event_cluster":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# 
+# print("best_macro_F_causal on dev is: {:}".format(best_macro_F_causal))
+# 
+# event_relation_graph = Event_Relation_Graph()
+# event_relation_graph.cuda()
+# event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_causal.ckpt', map_location=device))
+# 
+# if coreference_train_method == "event_pairs":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# if coreference_train_method == "event_cluster":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# 
+# print("best_macro_F_subevent on dev is: {:}".format(best_macro_F_subevent))
+# 
+# event_relation_graph = Event_Relation_Graph()
+# event_relation_graph.cuda()
+# event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_subevent.ckpt', map_location=device))
+# 
+# if coreference_train_method == "event_pairs":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# if coreference_train_method == "event_cluster":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# 
+# print("best_conll_F_coreference on dev is: {:}".format(best_conll_F_coreference))
+# 
+# event_relation_graph = Event_Relation_Graph()
+# event_relation_graph.cuda()
+# event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_conll_F_coreference.ckpt', map_location=device))
+# 
+# if coreference_train_method == "event_pairs":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# if coreference_train_method == "event_cluster":
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
+# 
+# 
+# if coreference_train_method == "event_pairs":
+# 
+#     print("best_macro_F_coreference on dev is: {:}".format(best_macro_F_coreference))
+# 
+#     event_relation_graph = Event_Relation_Graph()
+#     event_relation_graph.cuda()
+#     event_relation_graph.load_state_dict(torch.load('./saved_models/event_relation_graph/best_macro_F_coreference.ckpt', map_location=device))
+# 
+#     macro_F_event, macro_F_temporal, macro_F_causal, macro_F_subevent, macro_F_coreference, conll_F_coreference, macro_F_graph = \
+#         evaluate(event_relation_graph, test_dataloader, verbose=1)
 
 
 
