@@ -52,16 +52,16 @@ python -c "import nltk; nltk.download('punkt')"
 ### 1. Download Datasets
 
 **MAVEN-ERE Dataset:**
-- Download from: https://github.com/THU-KEG/MAVEN-ERE
+
 - Files needed: `train.jsonl`, `valid.jsonl`
 - Place in: `./MAVEN_ERE/`
 
 **BASIL Dataset:**
-- Download from: https://github.com/marshallwhiteorg/BASIL
+
 - Place original JSON files in: `./BASIL/`
 
 **BiasedSents Dataset:**
-- Download from: https://github.com/SoraLim/BiasedSents
+
 - Place original JSON files in: `./BiasedSents/`
 
 ### 2. Create Output Directories
