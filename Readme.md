@@ -8,7 +8,7 @@ This project implements a hierarchical dual-view event relation graph architectu
 
 All trained models and processed datasets are available in our Google Drive:
 
-**📁 Google Drive Link:** https://drive.google.com/drive/folders/1R6fncQVNWPjmbIGHg8PZY0pQZEU441Oq?usp=sharing
+**📁 Google Drive Link:** https://drive.google.com/drive/folders/1_Zzep6yu3ZuZ7GOfhg4tX8J8K0i35sGo?usp=drive_link
 
 This drive contains:
 - Trained event extraction models (6 checkpoints)
