@@ -446,6 +446,113 @@ class GAT_Layer(nn.Module):
         return new_embeddings
 
 
+class Cross_View_Attention_Document(nn.Module):
+    """Level 2: Document-Level, Cross-View Interaction between Factual and Interpretive Paragraphs"""
+    def __init__(self, feature_dim):
+        super(Cross_View_Attention_Document, self).__init__()
+        self.feature_dim = feature_dim
+        
+        # Cross-attention weights for document-level paragraph nodes
+        self.W_Q_F = nn.Linear(feature_dim, feature_dim)
+        self.W_K_I = nn.Linear(feature_dim, feature_dim)
+        self.W_V_I = nn.Linear(feature_dim, feature_dim)
+
+        self.W_Q_I = nn.Linear(feature_dim, feature_dim)
+        self.W_K_F = nn.Linear(feature_dim, feature_dim)
+        self.W_V_F = nn.Linear(feature_dim, feature_dim)
+        
+        self.W_F_out = nn.Linear(feature_dim * 2, feature_dim)
+        self.W_I_out = nn.Linear(feature_dim * 2, feature_dim)
+
+    def forward(self, F_paragraphs, I_paragraphs):
+        """
+        F_paragraphs: (N_F_para, feature_dim) - Factual-dominant paragraph embeddings
+        I_paragraphs: (N_I_para, feature_dim) - Interpretive-dominant paragraph embeddings
+        """
+        if F_paragraphs.size(0) == 0 and I_paragraphs.size(0) == 0:
+            return F_paragraphs, I_paragraphs
+        if F_paragraphs.size(0) == 0:
+            return F_paragraphs, I_paragraphs.clone()
+        if I_paragraphs.size(0) == 0:
+            return F_paragraphs.clone(), I_paragraphs
+        
+        # Factual paragraphs attend to Interpretive paragraphs
+        Q_F = self.W_Q_F(F_paragraphs)
+        K_I = self.W_K_I(I_paragraphs)
+        V_I = self.W_V_I(I_paragraphs)
+        
+        attention_weights_F_I = F.softmax(Q_F @ K_I.transpose(0, 1) / math.sqrt(self.feature_dim), dim=1)
+        I_context_for_F = attention_weights_F_I @ V_I
+
+        # Interpretive paragraphs attend to Factual paragraphs
+        Q_I = self.W_Q_I(I_paragraphs)
+        K_F = self.W_K_F(F_paragraphs)
+        V_F = self.W_V_F(F_paragraphs)
+        
+        attention_weights_I_F = F.softmax(Q_I @ K_F.transpose(0, 1) / math.sqrt(self.feature_dim), dim=1)
+        F_context_for_I = attention_weights_I_F @ V_F
+        
+        # Final update with cross-view context
+        F_updated = F.relu(self.W_F_out(torch.cat([F_paragraphs, I_context_for_F], dim=1)))
+        I_updated = F.relu(self.W_I_out(torch.cat([I_paragraphs, F_context_for_I], dim=1)))
+        
+        return F_updated, I_updated
+
+
+class Cross_View_Attention_Document(nn.Module):
+    """Level 2: Document-Level, Cross-View Interaction between Factual/Interpretive Paragraphs"""
+    def __init__(self, feature_dim):
+        super(Cross_View_Attention_Document, self).__init__()
+        self.feature_dim = feature_dim
+        
+        # Cross-attention weights (W_Q, W_K, W_V)
+        self.W_Q_F = nn.Linear(feature_dim, feature_dim) 
+        self.W_K_I = nn.Linear(feature_dim, feature_dim) 
+        self.W_V_I = nn.Linear(feature_dim, feature_dim) 
+
+        self.W_Q_I = nn.Linear(feature_dim, feature_dim) 
+        self.W_K_F = nn.Linear(feature_dim, feature_dim) 
+        self.W_V_F = nn.Linear(feature_dim, feature_dim) 
+        
+        self.W_F_out = nn.Linear(feature_dim * 2, feature_dim)
+        self.W_I_out = nn.Linear(feature_dim * 2, feature_dim)
+
+    def forward(self, F_paragraphs, I_paragraphs):
+        """
+        Cross-view attention between factual-dominant and interpretive-dominant paragraphs
+        F_paragraphs: (N_F_para, feature_dim)
+        I_paragraphs: (N_I_para, feature_dim)
+        """
+        if F_paragraphs.size(0) == 0 and I_paragraphs.size(0) == 0:
+             return F_paragraphs, I_paragraphs 
+        if F_paragraphs.size(0) == 0:
+             return F_paragraphs, I_paragraphs.clone() 
+        if I_paragraphs.size(0) == 0:
+             return F_paragraphs.clone(), I_paragraphs 
+        
+        # Factual Paragraphs <- Interpretive Paragraphs
+        Q_F = self.W_Q_F(F_paragraphs)
+        K_I = self.W_K_I(I_paragraphs)
+        V_I = self.W_V_I(I_paragraphs)
+        
+        attention_weights_F_I = F.softmax(Q_F @ K_I.transpose(0, 1) / math.sqrt(self.feature_dim), dim=1)
+        I_context_for_F = attention_weights_F_I @ V_I
+
+        # Interpretive Paragraphs <- Factual Paragraphs
+        Q_I = self.W_Q_I(I_paragraphs)
+        K_F = self.W_K_F(F_paragraphs)
+        V_F = self.W_V_F(F_paragraphs)
+        
+        attention_weights_I_F = F.softmax(Q_I @ K_F.transpose(0, 1) / math.sqrt(self.feature_dim), dim=1)
+        F_context_for_I = attention_weights_I_F @ V_F
+        
+        # Final update 
+        F_updated = F.relu(self.W_F_out(torch.cat([F_paragraphs, I_context_for_F], dim=1)))
+        I_updated = F.relu(self.W_I_out(torch.cat([I_paragraphs, F_context_for_I], dim=1)))
+        
+        return F_updated, I_updated
+
+
 # --- 6. The Complete Dual-View Hierarchical Model ---
 
 class Dual_View_Model(nn.Module):
@@ -467,8 +574,10 @@ class Dual_View_Model(nn.Module):
         # Paragraph Aggregation 
         self.paragraph_agg = nn.Linear(feature_dim * 2, feature_dim)
 
-        # Level 2: Document-Level GNN
-        self.GAT_Document = GAT_Layer(feature_dim)
+        # Level 2: Document-Level Dual-View GNN
+        self.R_GAT_Document_Factual = R_GAT_Layer(feature_dim, self.relation_types)
+        self.R_GAT_Document_Interpretive = R_GAT_Layer(feature_dim, self.relation_types)
+        self.Cross_View_Attn_Document = Cross_View_Attention_Document(feature_dim)
         
         # Final Sentence Classification Head (Feature Fusion)
         self.bias_sentence_head_1 = nn.Linear(feature_dim * 3, feature_dim)
@@ -534,6 +643,7 @@ class Dual_View_Model(nn.Module):
         
         unique_paragraph_ids = torch.unique(label_sentence[:, 4])
         paragraph_representations = torch.zeros((len(unique_paragraph_ids), self.feature_dim)).to(device)
+        paragraph_dominance = torch.zeros(len(unique_paragraph_ids), dtype=torch.long).to(device)  # 0=Factual, 1=Interpretive
         
         # CRITICAL: Simplify the relation labels tensor to pass only coreference to R-GAT
         # This tensor's shape is (N_pairs, 1)
@@ -547,6 +657,8 @@ class Dual_View_Model(nn.Module):
             if p_mask.size(0) == 0:
                 sent_mask = (label_sentence[:,4] == p_id).nonzero(as_tuple=True)[0]
                 paragraph_representations[p_idx] = torch.mean(sentence_embeddings[sent_mask], dim=0) if sent_mask.size(0) > 0 else torch.zeros(self.feature_dim).to(device)
+                # Default to factual if no events
+                paragraph_dominance[p_idx] = 0
                 continue
             
             p_events = event_embeddings[p_mask]
@@ -571,18 +683,83 @@ class Dual_View_Model(nn.Module):
             
             paragraph_representations[p_idx] = F.relu(self.paragraph_agg(torch.cat([F_summary, I_summary], dim=0)))
             
-        # B) Level 2: Document-Level Processing
+            # Determine paragraph dominance based on event counts
+            if F_mask.size(0) >= I_mask.size(0):
+                paragraph_dominance[p_idx] = 0  # Factual-dominant
+            else:
+                paragraph_dominance[p_idx] = 1  # Interpretive-dominant
+            
+        # B) Level 2: Document-Level Dual-View Processing
         N_para = paragraph_representations.size(0)
-        adj_doc = torch.zeros((N_para, N_para)).to(device)
         
-        # Document adjacency: Sequential adjacency (P_i -> P_i+1)
-        for i in range(N_para - 1):
-            adj_doc[i, i+1] = 1
-            adj_doc[i+1, i] = 1
-        adj_doc += torch.eye(N_para).to(device) # Self-loop
+        # Separate paragraphs into Factual-dominant and Interpretive-dominant views
+        F_para_mask = (paragraph_dominance == 0).nonzero(as_tuple=True)[0]
+        I_para_mask = (paragraph_dominance == 1).nonzero(as_tuple=True)[0]
         
-        # Apply Document GAT
-        updated_paragraph_representations = self.GAT_Document(paragraph_representations, adj_doc)
+        F_para_embeddings = paragraph_representations[F_para_mask]
+        I_para_embeddings = paragraph_representations[I_para_mask]
+        
+        # Create adjacency matrices for document-level graphs (sequential adjacency)
+        # For factual paragraphs
+        N_F_para = F_para_embeddings.size(0)
+        adj_doc_F = torch.zeros((N_F_para, N_F_para)).to(device)
+        if N_F_para > 1:
+            for i in range(N_F_para - 1):
+                adj_doc_F[i, i+1] = 1
+                adj_doc_F[i+1, i] = 1
+            adj_doc_F += torch.eye(N_F_para).to(device)
+        elif N_F_para == 1:
+            adj_doc_F = torch.ones((1, 1)).to(device)
+        
+        # For interpretive paragraphs
+        N_I_para = I_para_embeddings.size(0)
+        adj_doc_I = torch.zeros((N_I_para, N_I_para)).to(device)
+        if N_I_para > 1:
+            for i in range(N_I_para - 1):
+                adj_doc_I[i, i+1] = 1
+                adj_doc_I[i+1, i] = 1
+            adj_doc_I += torch.eye(N_I_para).to(device)
+        elif N_I_para == 1:
+            adj_doc_I = torch.ones((1, 1)).to(device)
+        
+        # Apply Document-Level R-GAT (using GAT_Layer's forward with adj_matrix)
+        # Note: R_GAT_Layer expects (embeddings, pairs, labels), but at document level
+        # we use sequential structure, so we'll use a simpler approach
+        
+        # For now, use standard GAT processing (can enhance later with relation modeling)
+        if N_F_para > 0:
+            # Simple transformation using the R-GAT structure (without explicit pairs)
+            F_para_updated = self.R_GAT_Document_Factual.W_V(F_para_embeddings)
+            if N_F_para > 1:
+                # Apply attention-based aggregation
+                attention_input = torch.cat([F_para_embeddings.repeat(1, N_F_para).view(N_F_para * N_F_para, self.feature_dim),
+                                            F_para_embeddings.repeat(N_F_para, 1)], dim=1)
+                e = self.R_GAT_Document_Factual.a_R['coref'](attention_input).view(N_F_para, N_F_para)
+                e = e.masked_fill(adj_doc_F == 0, float('-inf'))
+                attention_weights = F.softmax(self.R_GAT_Document_Factual.leakyrelu(e), dim=1)
+                F_para_updated = attention_weights @ F_para_updated + F_para_embeddings
+        else:
+            F_para_updated = F_para_embeddings
+            
+        if N_I_para > 0:
+            I_para_updated = self.R_GAT_Document_Interpretive.W_V(I_para_embeddings)
+            if N_I_para > 1:
+                attention_input = torch.cat([I_para_embeddings.repeat(1, N_I_para).view(N_I_para * N_I_para, self.feature_dim),
+                                            I_para_embeddings.repeat(N_I_para, 1)], dim=1)
+                e = self.R_GAT_Document_Interpretive.a_R['coref'](attention_input).view(N_I_para, N_I_para)
+                e = e.masked_fill(adj_doc_I == 0, float('-inf'))
+                attention_weights = F.softmax(self.R_GAT_Document_Interpretive.leakyrelu(e), dim=1)
+                I_para_updated = attention_weights @ I_para_updated + I_para_embeddings
+        else:
+            I_para_updated = I_para_embeddings
+        
+        # Apply Document-Level Cross-View Attention
+        F_para_final, I_para_final = self.Cross_View_Attn_Document(F_para_updated, I_para_updated)
+        
+        # Reconstruct full paragraph representations
+        updated_paragraph_representations = torch.zeros_like(paragraph_representations).to(device)
+        updated_paragraph_representations[F_para_mask] = F_para_final
+        updated_paragraph_representations[I_para_mask] = I_para_final
         
         # --- Stage 4: Final Sentence Classification (Feature Fusion) ---
         
