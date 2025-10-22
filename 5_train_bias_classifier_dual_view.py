@@ -26,19 +26,22 @@ from sklearn.metrics import precision_recall_fscore_support, classification_repo
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--fold', type=int, required=True, help='Which fold to run (0-9)')
-parser.add_argument('--gpu', type=int, required=True, choices=[0, 1, 2, 3], help='Which physical GPU index (0-3) to map this process to')
-# CRITICAL FIX: Directing output to scratch path
-parser.add_argument('--output_dir', type=str, default='/scratch/atharv.johar/Media-Bias-Analysis/results_dual_view', help='Output directory')
+parser.add_argument('--gpu', type=int, default=0, help='GPU index to use (default: 0)')
+# Output directory - adjust to your gnode path
+parser.add_argument('--output_dir', type=str, default='./results_dual_view', help='Output directory')
 args = parser.parse_args()
 
-# CRITICAL FIX: Isolate the process to the assigned GPU index
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Device setup for single GPU
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Device setup for single GPU
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 if torch.cuda.is_available():
-    print(f"[Fold {args.fold}] Assigned to GPU {args.gpu}: {torch.cuda.get_device_name(0)}")
+    print(f"[Fold {args.fold}] Using GPU: {torch.cuda.get_device_name(0)}")
+    print(f"[Fold {args.fold}] GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 else:
-    print(f"[Fold {args.fold}] Assigned to CPU (GPU {args.gpu} not available).")
+    print(f"[Fold {args.fold}] Using CPU (GPU not available).")
 
 
 # --- 2. Hyper-parameters ---
