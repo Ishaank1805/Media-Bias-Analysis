@@ -1,9 +1,9 @@
-
 #!/usr/bin/env python3
 """
-Two-Level Dual-View Hierarchical GNN for Media Bias Detection
-COMPLETE VERSION with ALL Research-Backed Innovations + CLI Arguments for Testing
-Now with multi-GPU parallel fold execution.
+Ablation 1: No Dual-View (Unified Graph)
+This model removes the Factual/Interpretive split.
+All events are fed into a single GNN (R_GAT_Unified).
+Cross-View Attention and Contrastive Loss are disabled.
 """
 
 import os
@@ -26,7 +26,7 @@ from transformers import LongformerTokenizer, LongformerModel
 from transformers import get_linear_schedule_with_warmup
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import precision_recall_fscore_support, classification_report, confusion_matrix
+from sklearn.metrics import precision_recall_fscore_support, classification_report
 
 # Try to import sentence-transformers for semantic paragraph detection
 try:
@@ -41,7 +41,7 @@ except ImportError:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Two-Level Dual-View GNN for Media Bias Detection',
+        description='Ablation 1: Unified Graph GNN for Media Bias Detection',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -62,13 +62,11 @@ def parse_arguments():
                        help='Maximum sequence length')
     parser.add_argument('--edge_dropout', type=float, default=0.1,
                        help='Adaptive edge dropout rate')
-    parser.add_argument('--contrastive_weight', type=float, default=0.3,
-                       help='Weight for contrastive loss')
     
     # Paths
     parser.add_argument('--data_dir', type=str, default='./BASIL_event_graph_classified',
                        help='Directory containing classified event graphs')
-    parser.add_argument('--results_dir', type=str, default='./results',
+    parser.add_argument('--results_dir', type=str, default='./results_ablation_1',
                        help='Directory to save results')
     
     # Other options
@@ -91,7 +89,7 @@ def parse_arguments():
         print("   - Limiting to first 30 files\n")
         args.n_folds = 1
         args.epochs = 3
-        args.max_files = 30  # Increased to ensure training data
+        args.max_files = 30
     
     return args
 
@@ -112,7 +110,7 @@ RESULTS_DIR = args.results_dir
 Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
 
 print("="*70)
-print("TWO-LEVEL DUAL-VIEW WITH ADVANCED FEATURES")
+print("ABLATION 1: NO DUAL-VIEW (UNIFIED GRAPH)")
 print("="*70)
 if torch.cuda.is_available():
     print(f"Available GPUs: {torch.cuda.device_count()}")
@@ -140,7 +138,7 @@ lambda_coreference = 1.0
 lambda_temporal = 1.0
 lambda_causal = 1.0
 lambda_subevent = 1.0
-lambda_contrastive = args.contrastive_weight
+lambda_contrastive = 0.0 # Disabled for this ablation
 
 no_decay = ['bias', 'LayerNorm.weight']
 longformer_weight_decay = 1e-2
@@ -488,7 +486,7 @@ class custom_dataset(Dataset):
             "label_subevent": label_subevent
         }
 
-# ==================== INNOVATIONS ====================
+# ==================== INNOVATIONS (Modified for Ablation) ====================
 
 class AdaptiveEdgeDropout(nn.Module):
     """
@@ -577,40 +575,6 @@ class MultiScaleAttentionPooling(nn.Module):
         out = out.transpose(0, 1).contiguous().view(1, -1)  # (1, num_heads * head_dim) = (1, feature_dim)
         
         return self.W_out(out).squeeze(0)  # (feature_dim,)
-
-
-class DualViewContrastiveLoss(nn.Module):
-    """
-    INNOVATION 3: Contrastive learning between Factual and Interpretive views
-    Hypothesis: Biased sentences show tighter F-I coupling
-    """
-    def __init__(self, temperature=0.07):
-        super().__init__()
-        self.temperature = temperature
-    
-    def forward(self, F_summaries, I_summaries, sentence_labels=None):
-        """
-        F_summaries: (N_sentences, feature_dim) - Factual event summaries per sentence
-        I_summaries: (N_sentences, feature_dim) - Interpretive event summaries per sentence
-        """
-        if F_summaries.size(0) == 0 or I_summaries.size(0) == 0:
-            return torch.tensor(0.0).to(F_summaries.device)
-        
-        # Normalize
-        F_norm = F.normalize(F_summaries, dim=1)
-        I_norm = F.normalize(I_summaries, dim=1)
-        
-        # Similarity: how well F and I from same sentence match
-        similarity = torch.matmul(F_norm, I_norm.t()) / self.temperature
-        
-        # Positive pairs: F and I from SAME sentence
-        labels = torch.arange(F_summaries.size(0)).to(similarity.device)
-        
-        # InfoNCE loss: Pull same-sentence F-I together, push different apart
-        loss = F.cross_entropy(similarity, labels)
-        
-        return loss
-
 
 # ==================== MODEL COMPONENTS ====================
 
@@ -716,48 +680,6 @@ class R_GAT_Layer(nn.Module):
                 
         return new_embeddings
 
-
-class Cross_View_Attention(nn.Module):
-    """Cross-view attention between Factual and Interpretive"""
-    def __init__(self, feature_dim):
-        super(Cross_View_Attention, self).__init__()
-        self.feature_dim = feature_dim
-        
-        self.W_Q_F = nn.Linear(feature_dim, feature_dim)
-        self.W_K_I = nn.Linear(feature_dim, feature_dim)
-        self.W_V_I = nn.Linear(feature_dim, feature_dim)
-        self.W_Q_I = nn.Linear(feature_dim, feature_dim)
-        self.W_K_F = nn.Linear(feature_dim, feature_dim)
-        self.W_V_F = nn.Linear(feature_dim, feature_dim)
-        self.W_F_out = nn.Linear(feature_dim * 2, feature_dim)
-        self.W_I_out = nn.Linear(feature_dim * 2, feature_dim)
-
-    def forward(self, F_events, I_events):
-        if F_events.size(0) == 0 and I_events.size(0) == 0:
-            return F_events, I_events
-        if F_events.size(0) == 0:
-            return F_events, I_events.clone()
-        if I_events.size(0) == 0:
-            return F_events.clone(), I_events
-        
-        Q_F = self.W_Q_F(F_events)
-        K_I = self.W_K_I(I_events)
-        V_I = self.W_V_I(I_events)
-        attn_F_I = F.softmax(Q_F @ K_I.transpose(0, 1) / math.sqrt(self.feature_dim), dim=1)
-        I_context_for_F = attn_F_I @ V_I
-
-        Q_I = self.W_Q_I(I_events)
-        K_F = self.W_K_F(F_events)
-        V_F = self.W_V_F(F_events)
-        attn_I_F = F.softmax(Q_I @ K_F.transpose(0, 1) / math.sqrt(self.feature_dim), dim=1)
-        F_context_for_I = attn_I_F @ V_F
-        
-        F_updated = F.relu(self.W_F_out(torch.cat([F_events, I_context_for_F], dim=1)))
-        I_updated = F.relu(self.W_I_out(torch.cat([I_events, F_context_for_I], dim=1)))
-        
-        return F_updated, I_updated
-
-
 class GAT_Layer(nn.Module):
     """Document-level paragraph GAT"""
     def __init__(self, feature_dim):
@@ -783,11 +705,12 @@ class GAT_Layer(nn.Module):
         return new_embeddings
 
 
-# ==================== MAIN MODEL ====================
+# ==================== MAIN MODEL (Ablation 1) ====================
 
 class Dual_View_Model(nn.Module):
     """
-    Complete model with ALL innovations
+    ABLATION 1: No Dual-View (Unified Graph)
+    All events are processed by a single GNN.
     """
     def __init__(self):
         super(Dual_View_Model, self).__init__()
@@ -798,7 +721,7 @@ class Dual_View_Model(nn.Module):
         self.bilstm_token = nn.LSTM(input_size=feature_dim, hidden_size=feature_dim//2, 
                                      batch_first=True, bidirectional=True)
         
-        # Soft distillation heads
+        # Soft distillation heads (unchanged)
         self.event_head_1 = nn.Linear(feature_dim, feature_dim, bias=True)
         nn.init.xavier_uniform_(self.event_head_1.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.event_head_1.bias)
@@ -834,20 +757,23 @@ class Dual_View_Model(nn.Module):
         nn.init.xavier_uniform_(self.subevent_head_2.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.subevent_head_2.bias)
         
-        # INNOVATIONS
+        # Innovations (partially kept)
         self.adaptive_dropout = AdaptiveEdgeDropout(edge_dropout_rate)
-        self.F_pooling = MultiScaleAttentionPooling(feature_dim, num_heads=4)
-        self.I_pooling = MultiScaleAttentionPooling(feature_dim, num_heads=4)
-        self.contrastive_loss = DualViewContrastiveLoss(temperature=0.07)
         
-        # Dual-view components
-        self.R_GAT_Factual = R_GAT_Layer(feature_dim)
-        self.R_GAT_Interpretive = R_GAT_Layer(feature_dim)
-        self.Cross_View_Attn = Cross_View_Attention(feature_dim)
-        self.paragraph_agg = nn.Linear(feature_dim * 2, feature_dim)
+        # --- ABLATION CHANGES ---
+        # 1. Removed R_GAT_Interpretive, Cross_View_Attn, I_pooling, contrastive_loss
+        # 2. Renamed R_GAT_Factual -> R_GAT_Unified
+        # 3. Renamed F_pooling -> Unified_pooling
+        # 4. Changed paragraph_agg input from feature_dim*2 to feature_dim
+        
+        self.R_GAT_Unified = R_GAT_Layer(feature_dim)
+        self.Unified_pooling = MultiScaleAttentionPooling(feature_dim, num_heads=4)
+        self.paragraph_agg = nn.Linear(feature_dim, feature_dim) # Input is feature_dim, not 2*
+        # --- END ABLATION CHANGES ---
+        
         self.GAT_Document = GAT_Layer(feature_dim)
         
-        # Classifier
+        # Classifier (unchanged)
         self.bias_sentence_1 = nn.Linear(feature_dim * 3, feature_dim, bias=True)
         nn.init.xavier_uniform_(self.bias_sentence_1.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.bias_sentence_1.bias)
@@ -859,12 +785,12 @@ class Dual_View_Model(nn.Module):
         self.crossentropyloss = nn.CrossEntropyLoss(reduction='mean')
         self.crossentropyloss_sum = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS, reduction='sum')
         
-    def build_paragraph_adjacency_with_coref(self, N_para, event_words, event_pairs, label_coreference):
+    def build_paragraph_adjacency_with_coref(self, N_para, event_words, event_pairs, label_coreference, current_device):
         """
         INNOVATION 4: Cross-paragraph coreference links
         Connect paragraphs that discuss the same events
         """
-        adj = torch.eye(N_para).to(device)
+        adj = torch.eye(N_para).to(current_device)
         
         # Sequential connections
         if N_para > 1:
@@ -891,29 +817,35 @@ class Dual_View_Model(nn.Module):
         return adj
         
     def forward(self, batch):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        label_sentence = batch['label_sentence'][0].to(device)
-        event_words = batch['event_words'][0].to(device)
-        event_pairs = batch['event_pairs'][0].to(device)
-        label_coreference = batch['label_coreference'][0].to(device)
-        label_temporal = batch['label_temporal'][0].to(device)
-        label_causal = batch['label_causal'][0].to(device)
-        label_subevent = batch['label_subevent'][0].to(device)
+        # 1. Get device from an input tensor
+        current_device = batch['input_ids'].device
+        
+        # 2. Move data to the correct device
+        input_ids = batch['input_ids'].to(current_device)
+        attention_mask = batch['attention_mask'].to(current_device)
+        label_sentence = batch['label_sentence'][0].to(current_device)
+        event_words = batch['event_words'][0].to(current_device)
+        event_pairs = batch['event_pairs'][0].to(current_device)
+        label_coreference = batch['label_coreference'][0].to(current_device)
+        label_temporal = batch['label_temporal'][0].to(current_device)
+        label_causal = batch['label_causal'][0].to(current_device)
+        label_subevent = batch['label_subevent'][0].to(current_device)
+        
+        # 3. Create dummy loss tensors on the correct device
+        dummy_loss = torch.tensor(0.0).to(current_device)
         
         # Token encoding
         token_embeddings = self.token_embedding(input_ids, attention_mask)
         token_embeddings = token_embeddings.view(1, token_embeddings.shape[0], token_embeddings.shape[1])
         
-        h0 = torch.zeros(2, 1, self.feature_dim//2).to(device).requires_grad_()
-        c0 = torch.zeros(2, 1, self.feature_dim//2).to(device).requires_grad_()
+        h0 = torch.zeros(2, 1, self.feature_dim//2).to(current_device).requires_grad_()
+        c0 = torch.zeros(2, 1, self.feature_dim//2).to(current_device).requires_grad_()
         token_embeddings, _ = self.bilstm_token(token_embeddings, (h0, c0))
         token_embeddings = token_embeddings[0, :, :]
         
         sent_start_indices = label_sentence[:, 0].long()
         sentence_embeddings = token_embeddings[sent_start_indices]
         
-        # INNOVATION: Adaptive edge dropout during training
         relation_probs = {
             'coref': label_coreference,
             'temporal': label_temporal,
@@ -951,25 +883,23 @@ class Dual_View_Model(nn.Module):
                 sub_scores = self.subevent_head_2(self.relu(self.subevent_head_1(event_pair_emb)))
                 subevent_loss = self.crossentropyloss(sub_scores, label_subevent[:, :3])
             else:
-                coreference_loss = torch.tensor(0.0).to(device)
-                temporal_loss = torch.tensor(0.0).to(device)
-                causal_loss = torch.tensor(0.0).to(device)
-                subevent_loss = torch.tensor(0.0).to(device)
+                coreference_loss = dummy_loss
+                temporal_loss = dummy_loss
+                causal_loss = dummy_loss
+                subevent_loss = dummy_loss
         else:
-            event_embeddings = torch.zeros((0, self.feature_dim)).to(device)
-            event_loss = torch.tensor(0.0).to(device)
-            coreference_loss = torch.tensor(0.0).to(device)
-            temporal_loss = torch.tensor(0.0).to(device)
-            causal_loss = torch.tensor(0.0).to(device)
-            subevent_loss = torch.tensor(0.0).to(device)
+            event_embeddings = torch.zeros((0, self.feature_dim)).to(current_device)
+            event_loss = dummy_loss
+            coreference_loss = dummy_loss
+            temporal_loss = dummy_loss
+            causal_loss = dummy_loss
+            subevent_loss = dummy_loss
         
-        # LEVEL 1: Paragraph-level dual-view
+        # --- ABLATION 1: UNIFIED GRAPH ---
+        
+        # LEVEL 1: Paragraph-level unified-view
         unique_paras = torch.unique(label_sentence[:, 4])
-        para_reps = torch.zeros((len(unique_paras), self.feature_dim)).to(device)
-        
-        # For contrastive learning: collect F/I summaries per sentence
-        sentence_F_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(device)
-        sentence_I_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(device)
+        para_reps = torch.zeros((len(unique_paras), self.feature_dim)).to(current_device)
         
         for p_idx, p_id in enumerate(unique_paras):
             p_mask = (event_words[:, 8] == p_id).nonzero(as_tuple=True)[0]
@@ -980,41 +910,30 @@ class Dual_View_Model(nn.Module):
                     para_reps[p_idx] = torch.mean(sentence_embeddings[sent_mask], dim=0)
                 continue
             
+            # 1. Do NOT split events
             para_events = event_embeddings[p_mask]
             
-            F_mask = (event_words[p_mask, 7] == 0).nonzero(as_tuple=True)[0]
-            I_mask = (event_words[p_mask, 7] == 1).nonzero(as_tuple=True)[0]
+            # 2. Feed ALL events into the single unified GAT
+            Unified_updated = self.R_GAT_Unified(para_events, event_pairs_filtered, relation_probs_filtered)
             
-            F_events = para_events[F_mask] if F_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(device)
-            I_events = para_events[I_mask] if I_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(device)
-
-            # Use filtered edges
-            F_updated = self.R_GAT_Factual(F_events, event_pairs_filtered, relation_probs_filtered)
-            I_updated = self.R_GAT_Interpretive(I_events, event_pairs_filtered, relation_probs_filtered)
+            # 3. Bypass Cross-View Attention
             
-            F_final, I_final = self.Cross_View_Attn(F_updated, I_updated)
+            # 4. Pool the unified result
+            Unified_summary = self.Unified_pooling(Unified_updated)
             
-            # INNOVATION: Multi-scale attention pooling instead of mean
-            F_summary = self.F_pooling(F_final)
-            I_summary = self.I_pooling(I_final)
-            
-            para_reps[p_idx] = F.relu(self.paragraph_agg(torch.cat([F_summary, I_summary], dim=0)))
-            
-            # Store F/I summaries for each sentence in this paragraph
-            sent_in_para = (label_sentence[:, 4] == p_id).nonzero(as_tuple=True)[0]
-            for sent_idx in sent_in_para:
-                sentence_F_summaries[sent_idx] = F_summary
-                sentence_I_summaries[sent_idx] = I_summary
+            # 5. Aggregate the single summary vector
+            para_reps[p_idx] = F.relu(self.paragraph_agg(Unified_summary))
         
-        # INNOVATION: Contrastive loss between F and I views
-        contrastive_loss = self.contrastive_loss(sentence_F_summaries, sentence_I_summaries)
+        # 6. Contrastive loss is not applicable
+        contrastive_loss = dummy_loss
         
-        # LEVEL 2: Document-level with cross-paragraph coreference
+        # --- END ABLATION ---
+        
+        # LEVEL 2: Document-level (unchanged)
         N_para = para_reps.size(0)
         
-        # INNOVATION: Adjacency with coreference links
         adj_doc = self.build_paragraph_adjacency_with_coref(
-            N_para, event_words, event_pairs, label_coreference
+            N_para, event_words, event_pairs, label_coreference, current_device
         )
         
         updated_para_reps = self.GAT_Document(para_reps, adj_doc)
@@ -1023,12 +942,14 @@ class Dual_View_Model(nn.Module):
         sent_to_para = label_sentence[:, 4].long()
         para_context = updated_para_reps[sent_to_para]
         
-        # Event aggregation
-        event_agg = torch.zeros_like(sentence_embeddings).to(device)
+        # Event aggregation (unchanged)
+        event_agg = torch.zeros_like(sentence_embeddings).to(current_device)
         if event_words.size(0) > 0:
             min_sent = int(event_words[:, 2].min())
             max_sent = int(event_words[:, 2].max())
             for sent_idx in range(min_sent, max_sent + 1):
+                if sent_idx >= event_agg.size(0):
+                    break
                 event_mask = (event_words[:, 2] == sent_idx).nonzero(as_tuple=True)[0]
                 if event_mask.size(0) > 0:
                     event_agg[sent_idx] = torch.mean(event_embeddings[event_mask], dim=0)
@@ -1041,8 +962,8 @@ class Dual_View_Model(nn.Module):
             final_sent_emb = final_sent_emb[1:, :]
         
         if label_bias.size(0) == 0 or (label_bias < 0).any() or (label_bias > 1).any():
-            return (torch.zeros((1, 2)).to(device), label_bias, 
-                   torch.tensor(0.0).to(device), event_loss,
+            return (torch.zeros((1, 2)).to(current_device), label_bias, 
+                   dummy_loss, event_loss,
                    coreference_loss, temporal_loss, causal_loss, subevent_loss,
                    contrastive_loss)
         
@@ -1091,8 +1012,10 @@ def evaluate(model, eval_dataloader):
 def train_one_fold(fold_idx, folders):
     """Train and test a single fold"""
     
+    current_device = get_device(fold_idx % args.gpu_num)
+    
     print(f"\n{'='*70}")
-    print(f"FOLD {fold_idx}/{args.n_folds-1}")
+    print(f"STARTING FOLD {fold_idx}/{args.n_folds-1} on {current_device}")
     print(f"{'='*70}\n")
     
     seed_val = args.seed
@@ -1112,10 +1035,11 @@ def train_one_fold(fold_idx, folders):
         if j != dev_idx and j != test_idx:
             train_files.extend(folders[j])
 
-    print(f"[Fold {fold_idx}] Train: {len(train_files)}, Dev: {len(dev_files)}, Test: {len(test_files)}")
-
     model = Dual_View_Model()
-    model.to(device)
+    model.to(current_device)
+    global CLASS_WEIGHTS
+    CLASS_WEIGHTS = torch.tensor([1.0, 3.0]).to(current_device)
+
 
     param_all = list(model.named_parameters())
     optimizer_grouped_parameters = [
@@ -1145,20 +1069,24 @@ def train_one_fold(fold_idx, folders):
 
     best_dev_f1 = 0
 
-    # ✅ tqdm progress bar loop
     for epoch_i in range(num_epochs):
         np.random.shuffle(train_files)
         train_dataset = custom_dataset(train_files)
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
             
         model.train()
-        t0 = time.time()
         total_bias = 0
-        total_contrastive = 0
+        total_distill = 0
         num_batch = 0
-
-        # ✅ tqdm progress bar for batches
-        with tqdm(total=len(train_dataloader), desc=f"[Fold {fold_idx}] Epoch {epoch_i+1}/{num_epochs}", ncols=90) as pbar:
+        
+        progress_bar = tqdm(
+            total=len(train_dataloader), 
+            desc=f"[Fold {fold_idx} on {current_device}] Epoch {epoch_i+1}/{num_epochs}", 
+            ncols=100,
+            disable=(fold_idx % args.gpu_num != 0)
+        )
+        
+        with progress_bar as pbar:
             for step, batch in enumerate(train_dataloader):
                 optimizer.zero_grad()
 
@@ -1170,16 +1098,19 @@ def train_one_fold(fold_idx, folders):
                     continue
                 
                 total_bias += bias_loss.item()
-                total_contrastive += contrastive_loss.item()
+                distill_loss = event_loss + coref_loss + temp_loss + causal_loss + sub_loss
+                total_distill += distill_loss.item()
                 num_batch += 1
 
                 try:
+                    # Note: contrastive_loss is 0, so it has no effect
+                    (lambda_contrastive * contrastive_loss).backward(retain_graph=True) 
+                    
                     event_loss.backward(retain_graph=True)
                     coref_loss.backward(retain_graph=True)
                     temp_loss.backward(retain_graph=True)
                     causal_loss.backward(retain_graph=True)
                     sub_loss.backward(retain_graph=True)
-                    (lambda_contrastive * contrastive_loss).backward(retain_graph=True)
                     bias_loss.backward()
                 except RuntimeError:
                     pbar.update(1)
@@ -1189,21 +1120,24 @@ def train_one_fold(fold_idx, folders):
                 optimizer.step()
                 scheduler.step()
 
-                # ✅ update progress bar dynamically
                 pbar.set_postfix({
                     "BiasLoss": f"{bias_loss.item():.2f}",
-                    "Contrast": f"{contrastive_loss.item():.2f}"
+                    "Distill": f"{distill_loss.item():.2f}"
                 })
                 pbar.update(1)
 
-        # (optional: you can save checkpoints here if needed)
-        torch.save(model.state_dict(), f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt")
+        # Save checkpoint based on dev F1
+        precision, recall, dev_f1, _, _, _ = evaluate(model, dev_dataloader)
+        
+        if dev_f1 > best_dev_f1:
+            best_dev_f1 = dev_f1
+            torch.save(model.state_dict(), f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt")
 
-    # ✅ Evaluate after training
-    model.load_state_dict(torch.load(f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt", map_location=device))
+    # Test
+    model.load_state_dict(torch.load(f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt", map_location=current_device))
     precision, recall, test_f1, macro_f1, test_dec, test_lab = evaluate(model, test_dataloader)
 
-    print(f"[Fold {fold_idx}] TEST: P={precision:.4f}, R={recall:.4f}, F1={test_f1:.4f}")
+    print(f"[Fold {fold_idx} on {current_device}] TEST: P={precision:.4f}, R={recall:.4f}, F1={test_f1:.4f}")
 
     return {
         'fold': fold_idx,
@@ -1217,18 +1151,14 @@ def train_one_fold(fold_idx, folders):
 
 # ==================== MAIN EXECUTION ====================
 
-def run_fold_on_gpu(fold_i, folders, gpu_id):
+def run_fold_on_gpu(fold_i, folders):
     """Helper for multiprocessing — runs one fold on a specified GPU"""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    torch.cuda.set_device(0)
     return train_one_fold(fold_i, folders)
 
 
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("TWO-LEVEL DUAL-VIEW WITH ADVANCED INNOVATIONS")
-    print("Innovations: Contrastive Learning, Multi-Scale Attention,")
-    print("             Adaptive Dropout, Semantic Paragraphs, Coref Links")
+    print("ABLATION 1: NO DUAL-VIEW (UNIFIED GRAPH)")
     print("="*70 + "\n")
     
     if not SEMANTIC_AVAILABLE or args.no_semantic:
@@ -1245,14 +1175,19 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     pool = mp.Pool(processes=args.gpu_num)
 
-    async_results = []
-    for fold_i in tqdm(range(args.n_folds), desc="Overall folds", ncols=80):
-        gpu_id = fold_i % args.gpu_num
-        async_results.append(pool.apply_async(run_fold_on_gpu, args=(fold_i, folders, gpu_id)))
+    pool_args = [(fold_i, folders) for fold_i in range(args.n_folds)]
+
+    all_fold_results = []
+    
+    with tqdm(total=args.n_folds, desc="Overall Folds Progress", ncols=100) as pbar:
+        for result in pool.starmap(run_fold_on_gpu, pool_args):
+            all_fold_results.append(result)
+            pbar.update(1)
+
     pool.close()
     pool.join()
-
-    all_fold_results = [res.get() for res in async_results]
+    
+    all_fold_results.sort(key=lambda x: x['fold'])
 
     # ---- AGGREGATE RESULTS ----
     precisions = [f['precision'] for f in all_fold_results]
@@ -1266,9 +1201,36 @@ if __name__ == "__main__":
     avg_f1 = np.mean(f1s)
     std_f1 = np.std(f1s)
 
+    # --- Save final results ---
+    summary = {
+        'dataset': 'BASIL' if 'BASIL' in args.data_dir else args.data_dir,
+        'n_folds': args.n_folds,
+        'n_files': len(available_files),
+        'method': 'Ablation 1: No Dual-View (Unified Graph)',
+        'hyperparameters': {
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'max_len': args.max_len,
+            'seed': args.seed,
+            'edge_dropout': args.edge_dropout,
+            'contrastive_weight': lambda_contrastive # will be 0.0
+        },
+        'aggregated_metrics': {
+            'precision': {'mean': float(avg_precision), 'std': float(std_precision)},
+            'recall': {'mean': float(avg_recall), 'std': float(std_recall)},
+            'f1': {'mean': float(avg_f1), 'std': float(std_f1)}
+        },
+        'per_fold_results': all_fold_results
+    }
+    
+    output_filename = f"{RESULTS_DIR}/final_results_ablation_1.json"
+    with open(output_filename, 'w') as f:
+        json.dump(summary, f, indent=2)
+
     print("\n" + "="*70)
-    print(f"FINAL RESULT ({args.n_folds} FOLDS)")
+    print(f"FINAL RESULT ({args.n_folds} FOLDS) - ABLATION 1")
+    print(f"Results saved to {output_filename}")
     print("="*70)
-    print(f"Precision: {avg_precision:.2f} ± {std_precision:.2f}")
-    print(f"Recall:    {avg_recall:.2f} ± {std_recall:.2f}")
-    print(f"F1:        {avg_f1:.2f} ± {std_f1:.2f}")
+    print(f"Precision: {avg_precision:.4f} ± {std_precision:.4f}")
+    print(f"Recall:    {avg_recall:.4f} ± {std_recall:.4f}")
+    print(f"F1:        {avg_f1:.4f} ± {std_f1:.4f}")

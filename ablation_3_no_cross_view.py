@@ -1,9 +1,9 @@
-
 #!/usr/bin/env python3
 """
-Two-Level Dual-View Hierarchical GNN for Media Bias Detection
-COMPLETE VERSION with ALL Research-Backed Innovations + CLI Arguments for Testing
-Now with multi-GPU parallel fold execution.
+Ablation 3: No Cross-View Attention
+This model keeps the full Two-Level Dual-View hierarchy,
+but disables the Cross-View Attention module that links
+the Factual and Interpretive subgraphs.
 """
 
 import os
@@ -26,7 +26,7 @@ from transformers import LongformerTokenizer, LongformerModel
 from transformers import get_linear_schedule_with_warmup
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import precision_recall_fscore_support, classification_report, confusion_matrix
+from sklearn.metrics import precision_recall_fscore_support, classification_report
 
 # Try to import sentence-transformers for semantic paragraph detection
 try:
@@ -41,7 +41,7 @@ except ImportError:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Two-Level Dual-View GNN for Media Bias Detection',
+        description='Ablation 3: No Cross-View Attention for Media Bias Detection',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -68,7 +68,7 @@ def parse_arguments():
     # Paths
     parser.add_argument('--data_dir', type=str, default='./BASIL_event_graph_classified',
                        help='Directory containing classified event graphs')
-    parser.add_argument('--results_dir', type=str, default='./results',
+    parser.add_argument('--results_dir', type=str, default='./results_ablation_3',
                        help='Directory to save results')
     
     # Other options
@@ -91,7 +91,7 @@ def parse_arguments():
         print("   - Limiting to first 30 files\n")
         args.n_folds = 1
         args.epochs = 3
-        args.max_files = 30  # Increased to ensure training data
+        args.max_files = 30
     
     return args
 
@@ -112,7 +112,7 @@ RESULTS_DIR = args.results_dir
 Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
 
 print("="*70)
-print("TWO-LEVEL DUAL-VIEW WITH ADVANCED FEATURES")
+print("ABLATION 3: NO CROSS-VIEW ATTENTION")
 print("="*70)
 if torch.cuda.is_available():
     print(f"Available GPUs: {torch.cuda.device_count()}")
@@ -488,7 +488,7 @@ class custom_dataset(Dataset):
             "label_subevent": label_subevent
         }
 
-# ==================== INNOVATIONS ====================
+# ==================== INNOVATIONS (Modified for Ablation) ====================
 
 class AdaptiveEdgeDropout(nn.Module):
     """
@@ -783,11 +783,12 @@ class GAT_Layer(nn.Module):
         return new_embeddings
 
 
-# ==================== MAIN MODEL ====================
+# ==================== MAIN MODEL (Ablation 3) ====================
 
 class Dual_View_Model(nn.Module):
     """
-    Complete model with ALL innovations
+    ABLATION 3: No Cross-View Attention
+    - Cross_View_Attn module is bypassed
     """
     def __init__(self):
         super(Dual_View_Model, self).__init__()
@@ -834,7 +835,7 @@ class Dual_View_Model(nn.Module):
         nn.init.xavier_uniform_(self.subevent_head_2.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.subevent_head_2.bias)
         
-        # INNOVATIONS
+        # Innovations
         self.adaptive_dropout = AdaptiveEdgeDropout(edge_dropout_rate)
         self.F_pooling = MultiScaleAttentionPooling(feature_dim, num_heads=4)
         self.I_pooling = MultiScaleAttentionPooling(feature_dim, num_heads=4)
@@ -843,7 +844,12 @@ class Dual_View_Model(nn.Module):
         # Dual-view components
         self.R_GAT_Factual = R_GAT_Layer(feature_dim)
         self.R_GAT_Interpretive = R_GAT_Layer(feature_dim)
-        self.Cross_View_Attn = Cross_View_Attention(feature_dim)
+        
+        # --- ABLATION CHANGE ---
+        # 1. Cross_View_Attn is still initialized, but will be SKIPPED in forward()
+        self.Cross_View_Attn = Cross_View_Attention(feature_dim) 
+        # --- END ABLATION CHANGE ---
+        
         self.paragraph_agg = nn.Linear(feature_dim * 2, feature_dim)
         self.GAT_Document = GAT_Layer(feature_dim)
         
@@ -859,12 +865,12 @@ class Dual_View_Model(nn.Module):
         self.crossentropyloss = nn.CrossEntropyLoss(reduction='mean')
         self.crossentropyloss_sum = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS, reduction='sum')
         
-    def build_paragraph_adjacency_with_coref(self, N_para, event_words, event_pairs, label_coreference):
+    def build_paragraph_adjacency_with_coref(self, N_para, event_words, event_pairs, label_coreference, current_device):
         """
         INNOVATION 4: Cross-paragraph coreference links
         Connect paragraphs that discuss the same events
         """
-        adj = torch.eye(N_para).to(device)
+        adj = torch.eye(N_para).to(current_device)
         
         # Sequential connections
         if N_para > 1:
@@ -891,29 +897,35 @@ class Dual_View_Model(nn.Module):
         return adj
         
     def forward(self, batch):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        label_sentence = batch['label_sentence'][0].to(device)
-        event_words = batch['event_words'][0].to(device)
-        event_pairs = batch['event_pairs'][0].to(device)
-        label_coreference = batch['label_coreference'][0].to(device)
-        label_temporal = batch['label_temporal'][0].to(device)
-        label_causal = batch['label_causal'][0].to(device)
-        label_subevent = batch['label_subevent'][0].to(device)
+        # 1. Get device from an input tensor
+        current_device = batch['input_ids'].device
+        
+        # 2. Move data to the correct device
+        input_ids = batch['input_ids'].to(current_device)
+        attention_mask = batch['attention_mask'].to(current_device)
+        label_sentence = batch['label_sentence'][0].to(current_device)
+        event_words = batch['event_words'][0].to(current_device)
+        event_pairs = batch['event_pairs'][0].to(current_device)
+        label_coreference = batch['label_coreference'][0].to(current_device)
+        label_temporal = batch['label_temporal'][0].to(current_device)
+        label_causal = batch['label_causal'][0].to(current_device)
+        label_subevent = batch['label_subevent'][0].to(current_device)
+        
+        # 3. Create dummy loss tensors on the correct device
+        dummy_loss = torch.tensor(0.0).to(current_device)
         
         # Token encoding
         token_embeddings = self.token_embedding(input_ids, attention_mask)
         token_embeddings = token_embeddings.view(1, token_embeddings.shape[0], token_embeddings.shape[1])
         
-        h0 = torch.zeros(2, 1, self.feature_dim//2).to(device).requires_grad_()
-        c0 = torch.zeros(2, 1, self.feature_dim//2).to(device).requires_grad_()
+        h0 = torch.zeros(2, 1, self.feature_dim//2).to(current_device).requires_grad_()
+        c0 = torch.zeros(2, 1, self.feature_dim//2).to(current_device).requires_grad_()
         token_embeddings, _ = self.bilstm_token(token_embeddings, (h0, c0))
         token_embeddings = token_embeddings[0, :, :]
         
         sent_start_indices = label_sentence[:, 0].long()
         sentence_embeddings = token_embeddings[sent_start_indices]
         
-        # INNOVATION: Adaptive edge dropout during training
         relation_probs = {
             'coref': label_coreference,
             'temporal': label_temporal,
@@ -951,25 +963,24 @@ class Dual_View_Model(nn.Module):
                 sub_scores = self.subevent_head_2(self.relu(self.subevent_head_1(event_pair_emb)))
                 subevent_loss = self.crossentropyloss(sub_scores, label_subevent[:, :3])
             else:
-                coreference_loss = torch.tensor(0.0).to(device)
-                temporal_loss = torch.tensor(0.0).to(device)
-                causal_loss = torch.tensor(0.0).to(device)
-                subevent_loss = torch.tensor(0.0).to(device)
+                coreference_loss = dummy_loss
+                temporal_loss = dummy_loss
+                causal_loss = dummy_loss
+                subevent_loss = dummy_loss
         else:
-            event_embeddings = torch.zeros((0, self.feature_dim)).to(device)
-            event_loss = torch.tensor(0.0).to(device)
-            coreference_loss = torch.tensor(0.0).to(device)
-            temporal_loss = torch.tensor(0.0).to(device)
-            causal_loss = torch.tensor(0.0).to(device)
-            subevent_loss = torch.tensor(0.0).to(device)
+            event_embeddings = torch.zeros((0, self.feature_dim)).to(current_device)
+            event_loss = dummy_loss
+            coreference_loss = dummy_loss
+            temporal_loss = dummy_loss
+            causal_loss = dummy_loss
+            subevent_loss = dummy_loss
         
         # LEVEL 1: Paragraph-level dual-view
         unique_paras = torch.unique(label_sentence[:, 4])
-        para_reps = torch.zeros((len(unique_paras), self.feature_dim)).to(device)
+        para_reps = torch.zeros((len(unique_paras), self.feature_dim)).to(current_device)
         
-        # For contrastive learning: collect F/I summaries per sentence
-        sentence_F_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(device)
-        sentence_I_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(device)
+        sentence_F_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(current_device)
+        sentence_I_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(current_device)
         
         for p_idx, p_id in enumerate(unique_paras):
             p_mask = (event_words[:, 8] == p_id).nonzero(as_tuple=True)[0]
@@ -985,36 +996,34 @@ class Dual_View_Model(nn.Module):
             F_mask = (event_words[p_mask, 7] == 0).nonzero(as_tuple=True)[0]
             I_mask = (event_words[p_mask, 7] == 1).nonzero(as_tuple=True)[0]
             
-            F_events = para_events[F_mask] if F_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(device)
-            I_events = para_events[I_mask] if I_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(device)
+            F_events = para_events[F_mask] if F_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(current_device)
+            I_events = para_events[I_mask] if I_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(current_device)
 
-            # Use filtered edges
             F_updated = self.R_GAT_Factual(F_events, event_pairs_filtered, relation_probs_filtered)
             I_updated = self.R_GAT_Interpretive(I_events, event_pairs_filtered, relation_probs_filtered)
             
-            F_final, I_final = self.Cross_View_Attn(F_updated, I_updated)
+            # --- ABLATION 3: BYPASS CROSS-VIEW ATTENTION ---
+            F_final, I_final = F_updated, I_updated
+            # F_final, I_final = self.Cross_View_Attn(F_updated, I_updated) # This line is "commented out"
+            # --- END ABLATION ---
             
-            # INNOVATION: Multi-scale attention pooling instead of mean
             F_summary = self.F_pooling(F_final)
             I_summary = self.I_pooling(I_final)
             
             para_reps[p_idx] = F.relu(self.paragraph_agg(torch.cat([F_summary, I_summary], dim=0)))
             
-            # Store F/I summaries for each sentence in this paragraph
             sent_in_para = (label_sentence[:, 4] == p_id).nonzero(as_tuple=True)[0]
             for sent_idx in sent_in_para:
                 sentence_F_summaries[sent_idx] = F_summary
                 sentence_I_summaries[sent_idx] = I_summary
         
-        # INNOVATION: Contrastive loss between F and I views
         contrastive_loss = self.contrastive_loss(sentence_F_summaries, sentence_I_summaries)
         
-        # LEVEL 2: Document-level with cross-paragraph coreference
+        # LEVEL 2: Document-level
         N_para = para_reps.size(0)
         
-        # INNOVATION: Adjacency with coreference links
         adj_doc = self.build_paragraph_adjacency_with_coref(
-            N_para, event_words, event_pairs, label_coreference
+            N_para, event_words, event_pairs, label_coreference, current_device
         )
         
         updated_para_reps = self.GAT_Document(para_reps, adj_doc)
@@ -1024,11 +1033,13 @@ class Dual_View_Model(nn.Module):
         para_context = updated_para_reps[sent_to_para]
         
         # Event aggregation
-        event_agg = torch.zeros_like(sentence_embeddings).to(device)
+        event_agg = torch.zeros_like(sentence_embeddings).to(current_device)
         if event_words.size(0) > 0:
             min_sent = int(event_words[:, 2].min())
             max_sent = int(event_words[:, 2].max())
             for sent_idx in range(min_sent, max_sent + 1):
+                if sent_idx >= event_agg.size(0):
+                    break
                 event_mask = (event_words[:, 2] == sent_idx).nonzero(as_tuple=True)[0]
                 if event_mask.size(0) > 0:
                     event_agg[sent_idx] = torch.mean(event_embeddings[event_mask], dim=0)
@@ -1041,8 +1052,8 @@ class Dual_View_Model(nn.Module):
             final_sent_emb = final_sent_emb[1:, :]
         
         if label_bias.size(0) == 0 or (label_bias < 0).any() or (label_bias > 1).any():
-            return (torch.zeros((1, 2)).to(device), label_bias, 
-                   torch.tensor(0.0).to(device), event_loss,
+            return (torch.zeros((1, 2)).to(current_device), label_bias, 
+                   dummy_loss, event_loss,
                    coreference_loss, temporal_loss, causal_loss, subevent_loss,
                    contrastive_loss)
         
@@ -1091,8 +1102,10 @@ def evaluate(model, eval_dataloader):
 def train_one_fold(fold_idx, folders):
     """Train and test a single fold"""
     
+    current_device = get_device(fold_idx % args.gpu_num)
+    
     print(f"\n{'='*70}")
-    print(f"FOLD {fold_idx}/{args.n_folds-1}")
+    print(f"STARTING FOLD {fold_idx}/{args.n_folds-1} on {current_device}")
     print(f"{'='*70}\n")
     
     seed_val = args.seed
@@ -1112,10 +1125,11 @@ def train_one_fold(fold_idx, folders):
         if j != dev_idx and j != test_idx:
             train_files.extend(folders[j])
 
-    print(f"[Fold {fold_idx}] Train: {len(train_files)}, Dev: {len(dev_files)}, Test: {len(test_files)}")
-
     model = Dual_View_Model()
-    model.to(device)
+    model.to(current_device)
+    global CLASS_WEIGHTS
+    CLASS_WEIGHTS = torch.tensor([1.0, 3.0]).to(current_device)
+
 
     param_all = list(model.named_parameters())
     optimizer_grouped_parameters = [
@@ -1145,20 +1159,25 @@ def train_one_fold(fold_idx, folders):
 
     best_dev_f1 = 0
 
-    # ✅ tqdm progress bar loop
     for epoch_i in range(num_epochs):
         np.random.shuffle(train_files)
         train_dataset = custom_dataset(train_files)
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
             
         model.train()
-        t0 = time.time()
         total_bias = 0
+        total_distill = 0
         total_contrastive = 0
         num_batch = 0
-
-        # ✅ tqdm progress bar for batches
-        with tqdm(total=len(train_dataloader), desc=f"[Fold {fold_idx}] Epoch {epoch_i+1}/{num_epochs}", ncols=90) as pbar:
+        
+        progress_bar = tqdm(
+            total=len(train_dataloader), 
+            desc=f"[Fold {fold_idx} on {current_device}] Epoch {epoch_i+1}/{num_epochs}", 
+            ncols=100,
+            disable=(fold_idx % args.gpu_num != 0)
+        )
+        
+        with progress_bar as pbar:
             for step, batch in enumerate(train_dataloader):
                 optimizer.zero_grad()
 
@@ -1170,16 +1189,18 @@ def train_one_fold(fold_idx, folders):
                     continue
                 
                 total_bias += bias_loss.item()
+                distill_loss = event_loss + coref_loss + temp_loss + causal_loss + sub_loss
+                total_distill += distill_loss.item()
                 total_contrastive += contrastive_loss.item()
                 num_batch += 1
 
                 try:
+                    (lambda_contrastive * contrastive_loss).backward(retain_graph=True) 
                     event_loss.backward(retain_graph=True)
                     coref_loss.backward(retain_graph=True)
                     temp_loss.backward(retain_graph=True)
                     causal_loss.backward(retain_graph=True)
                     sub_loss.backward(retain_graph=True)
-                    (lambda_contrastive * contrastive_loss).backward(retain_graph=True)
                     bias_loss.backward()
                 except RuntimeError:
                     pbar.update(1)
@@ -1189,21 +1210,25 @@ def train_one_fold(fold_idx, folders):
                 optimizer.step()
                 scheduler.step()
 
-                # ✅ update progress bar dynamically
                 pbar.set_postfix({
                     "BiasLoss": f"{bias_loss.item():.2f}",
+                    "Distill": f"{distill_loss.item():.2f}",
                     "Contrast": f"{contrastive_loss.item():.2f}"
                 })
                 pbar.update(1)
 
-        # (optional: you can save checkpoints here if needed)
-        torch.save(model.state_dict(), f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt")
+        # Save checkpoint based on dev F1
+        precision, recall, dev_f1, _, _, _ = evaluate(model, dev_dataloader)
+        
+        if dev_f1 > best_dev_f1:
+            best_dev_f1 = dev_f1
+            torch.save(model.state_dict(), f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt")
 
-    # ✅ Evaluate after training
-    model.load_state_dict(torch.load(f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt", map_location=device))
+    # Test
+    model.load_state_dict(torch.load(f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt", map_location=current_device))
     precision, recall, test_f1, macro_f1, test_dec, test_lab = evaluate(model, test_dataloader)
 
-    print(f"[Fold {fold_idx}] TEST: P={precision:.4f}, R={recall:.4f}, F1={test_f1:.4f}")
+    print(f"[Fold {fold_idx} on {current_device}] TEST: P={precision:.4f}, R={recall:.4f}, F1={test_f1:.4f}")
 
     return {
         'fold': fold_idx,
@@ -1217,18 +1242,14 @@ def train_one_fold(fold_idx, folders):
 
 # ==================== MAIN EXECUTION ====================
 
-def run_fold_on_gpu(fold_i, folders, gpu_id):
+def run_fold_on_gpu(fold_i, folders):
     """Helper for multiprocessing — runs one fold on a specified GPU"""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    torch.cuda.set_device(0)
     return train_one_fold(fold_i, folders)
 
 
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("TWO-LEVEL DUAL-VIEW WITH ADVANCED INNOVATIONS")
-    print("Innovations: Contrastive Learning, Multi-Scale Attention,")
-    print("             Adaptive Dropout, Semantic Paragraphs, Coref Links")
+    print("ABLATION 3: NO CROSS-VIEW ATTENTION")
     print("="*70 + "\n")
     
     if not SEMANTIC_AVAILABLE or args.no_semantic:
@@ -1245,14 +1266,19 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     pool = mp.Pool(processes=args.gpu_num)
 
-    async_results = []
-    for fold_i in tqdm(range(args.n_folds), desc="Overall folds", ncols=80):
-        gpu_id = fold_i % args.gpu_num
-        async_results.append(pool.apply_async(run_fold_on_gpu, args=(fold_i, folders, gpu_id)))
+    pool_args = [(fold_i, folders) for fold_i in range(args.n_folds)]
+
+    all_fold_results = []
+    
+    with tqdm(total=args.n_folds, desc="Overall Folds Progress", ncols=100) as pbar:
+        for result in pool.starmap(run_fold_on_gpu, pool_args):
+            all_fold_results.append(result)
+            pbar.update(1)
+
     pool.close()
     pool.join()
-
-    all_fold_results = [res.get() for res in async_results]
+    
+    all_fold_results.sort(key=lambda x: x['fold'])
 
     # ---- AGGREGATE RESULTS ----
     precisions = [f['precision'] for f in all_fold_results]
@@ -1266,9 +1292,36 @@ if __name__ == "__main__":
     avg_f1 = np.mean(f1s)
     std_f1 = np.std(f1s)
 
+    # --- Save final results ---
+    summary = {
+        'dataset': 'BASIL' if 'BASIL' in args.data_dir else args.data_dir,
+        'n_folds': args.n_folds,
+        'n_files': len(available_files),
+        'method': 'Ablation 3: No Cross-View Attention',
+        'hyperparameters': {
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'max_len': args.max_len,
+            'seed': args.seed,
+            'edge_dropout': args.edge_dropout,
+            'contrastive_weight': args.contrastive_weight 
+        },
+        'aggregated_metrics': {
+            'precision': {'mean': float(avg_precision), 'std': float(std_precision)},
+            'recall': {'mean': float(avg_recall), 'std': float(std_recall)},
+            'f1': {'mean': float(avg_f1), 'std': float(std_f1)}
+        },
+        'per_fold_results': all_fold_results
+    }
+    
+    output_filename = f"{RESULTS_DIR}/final_results_ablation_3.json"
+    with open(output_filename, 'w') as f:
+        json.dump(summary, f, indent=2)
+
     print("\n" + "="*70)
-    print(f"FINAL RESULT ({args.n_folds} FOLDS)")
+    print(f"FINAL RESULT ({args.n_folds} FOLDS) - ABLATION 3")
+    print(f"Results saved to {output_filename}")
     print("="*70)
-    print(f"Precision: {avg_precision:.2f} ± {std_precision:.2f}")
-    print(f"Recall:    {avg_recall:.2f} ± {std_recall:.2f}")
-    print(f"F1:        {avg_f1:.2f} ± {std_f1:.2f}")
+    print(f"Precision: {avg_precision:.4f} ± {std_precision:.4f}")
+    print(f"Recall:    {avg_recall:.4f} ± {std_recall:.4f}")
+    print(f"F1:        {avg_f1:.4f} ± {std_f1:.4f}")
