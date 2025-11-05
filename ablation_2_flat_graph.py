@@ -621,6 +621,13 @@ class Token_Embedding(nn.Module):
             'allenai/longformer-base-4096', output_hidden_states=True)
 
     def forward(self, input_ids, attention_mask):
+        # Ensure the tensors are on the same device as the Longformer model
+        device = next(self.longformermodel.parameters()).device
+        if input_ids is not None:
+            input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
         outputs = self.longformermodel(input_ids=input_ids, attention_mask=attention_mask)
         hidden_states = outputs[2]
         token_embeddings_layers = torch.stack(hidden_states, dim=0)
@@ -841,9 +848,11 @@ class Dual_View_Model(nn.Module):
         self.crossentropyloss_sum = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS, reduction='sum')
         
     def forward(self, batch):
-        # 1. Get device from an input tensor
-        current_device = batch['input_ids'].device
-        
+        # 1. Determine device from the model parameters to ensure consistency
+        # between created tensors (hidden states) and inputs that may be moved
+        # inside Token_Embedding.
+        current_device = next(self.parameters()).device
+
         # 2. Move data to the correct device
         input_ids = batch['input_ids'].to(current_device)
         attention_mask = batch['attention_mask'].to(current_device)
@@ -861,9 +870,10 @@ class Dual_View_Model(nn.Module):
         # Token encoding
         token_embeddings = self.token_embedding(input_ids, attention_mask)
         token_embeddings = token_embeddings.view(1, token_embeddings.shape[0], token_embeddings.shape[1])
-        
-        h0 = torch.zeros(2, 1, self.feature_dim//2).to(current_device).requires_grad_()
-        c0 = torch.zeros(2, 1, self.feature_dim//2).to(current_device).requires_grad_()
+
+        device_tok = token_embeddings.device
+        h0 = torch.zeros(2, 1, self.feature_dim//2, device=device_tok).requires_grad_()
+        c0 = torch.zeros(2, 1, self.feature_dim//2, device=device_tok).requires_grad_()
         token_embeddings, _ = self.bilstm_token(token_embeddings, (h0, c0))
         token_embeddings = token_embeddings[0, :, :]
         
