@@ -1,31 +1,9 @@
-# ============================================================================
-# EVENT GRAPH EXTRACTION SCRIPT FOR MEDIA BIAS ANALYSIS
-# ============================================================================
-# This script applies trained event extraction models to extract event graphs
-# from news articles in two media bias datasets: BASIL and BiasedSents.
-#
-# Purpose:
-# 1. Load pre-trained event extraction models (identification, coreference, 
-#    temporal, causal, and subevent relation classifiers)
-# 2. Process articles from bias detection datasets
-# 3. Extract event triggers and their relationships
-# 4. Save enriched articles with event relation graphs for downstream bias analysis
-#
-# The event graphs will later be used for:
-# - Analyzing how different news sources present events differently
-# - Identifying bias through event framing and relation patterns
-# - Training bias classification models based on event structures
-# ============================================================================
 
 import os
-# Use GPU 0 for inference
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Uncomment for CUDA debugging
+#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
-# ============================================================================
-# GPU/CPU Device Configuration
-# ============================================================================
 import torch
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -36,16 +14,10 @@ else:
     device = torch.device("cpu")
 
 
-# ============================================================================
-# Import Required Libraries
-# ============================================================================
 
-# Data processing and manipulation
 import pandas as pd
 import numpy as np
 import json
-
-# PyTorch components
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -53,214 +25,135 @@ from torch import optim
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-
-# Transformers for pre-trained models
 from transformers import LongformerTokenizer, LongformerModel
-from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
-
-# Utilities
 import math
 import random
-
-# Scikit-learn for metrics
 import sklearn
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.metrics import accuracy_score
-
-# For coreference evaluation
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
 from collections import Counter
 from scipy.optimize import linear_sum_assignment
-
-# NLTK for tokenization
 import nltk
-nltk.download('punkt')  # Download punkt tokenizer data
+nltk.download('punkt')
 
 
 
-# ============================================================================
-# HYPERPARAMETERS AND CONFIGURATION
-# ============================================================================
+'''hyper-parameters'''
 
-# Maximum sequence length for Longformer (can handle up to 4096)
 MAX_LEN = 2048
-
-# Class weights for loss computation (inherited from training, but not used during inference)
-event_weight_positive = 1              # Weight for positive event examples
-coreference_weight_positive = 1        # Weight for coreferent pairs
-
-# Temporal relation weights
-temporal_weight_before = 1             # Label 1: event1 before event2
-temporal_weight_after = 1              # Label 2: event1 after event2
-temporal_weight_overlap = 1            # Label 3: events overlap
-
-# Causal relation weights  
-causal_weight_cause = 1                # Label 1: event1 causes event2
-causal_weight_caused = 1               # Label 2: event1 caused by event2
-
-# Subevent relation weights
-subevent_weight_contain = 1            # Label 1: event1 contains event2
-subevent_weight_contained = 1          # Label 2: event1 contained by event2
+event_weight_positive = 1
+coreference_weight_positive = 1
+temporal_weight_before = 1 # temporal label 1 before
+temporal_weight_after = 1 # temporal label 2 after
+temporal_weight_overlap = 1 # temporal label 3 overlap
+causal_weight_cause = 1 # causal label 1 cause
+causal_weight_caused = 1 # causal label 2 caused by
+subevent_weight_contain = 1 # subevent label 1 contain
+subevent_weight_contained = 1 # subevent label 2 contained by
 
 
 
-# ============================================================================
-# Initialize Global Components
-# ============================================================================
-
-# Softmax function for converting logits to probabilities
 softmax = nn.Softmax(dim = 1)
 softmax.cuda()
-
-# Tokenizer for converting text to token IDs
 tokenizer = LongformerTokenizer.from_pretrained('allenai/longformer-base-4096')
 
 
-# Suppress warnings for cleaner output during inference
+
 def warn(*args, **kwargs):
     pass
 import warnings
 warnings.warn = warn
 
 from transformers import logging
+
 logging.set_verbosity_warning()
 logging.set_verbosity_error()
 
 
 
 
-# ============================================================================
-# MODEL ARCHITECTURE DEFINITIONS
-# ============================================================================
-# These classes define the neural network architectures for each event
-# extraction task. Each model has the same structure as during training:
-# 1. Token Embedding (Longformer)
-# 2. BiLSTM layer
-# 3. Task-specific classification head
-# ============================================================================
-
-
 class Token_Embedding(nn.Module):
-    """
-    Longformer-based token encoder.
-    
-    Encodes input tokens into contextual embeddings using pre-trained Longformer.
-    Uses the sum of the last 4 hidden layers for richer representations.
-    
-    Input:
-        - input_ids: Token IDs, shape [1, sequence_length]
-        - attention_mask: Attention mask, shape [1, sequence_length]
-        
-    Output:
-        - token_embeddings: Contextual embeddings, shape [sequence_length, 768]
-    """
+
+    # input: input_ids, attention_mask, 1 article * number of tokens
+    # output: number of tokens * 768, dealing with one article at one time
 
     def __init__(self):
         super(Token_Embedding, self).__init__()
-        # Load pre-trained Longformer with all hidden states
+
         self.longformermodel = LongformerModel.from_pretrained('allenai/longformer-base-4096', output_hidden_states=True, )
 
     def forward(self, input_ids, attention_mask):
-        # Pass input through Longformer
+
         outputs = self.longformermodel(input_ids = input_ids, attention_mask = attention_mask)
-        
-        # Extract all hidden states (13 layers: embedding + 12 transformer blocks)
         hidden_states = outputs[2]
-        
-        # Stack layers: shape [13, batch_size(1), num_tokens, 768]
-        token_embeddings_layers = torch.stack(hidden_states, dim=0)
-        
-        # Remove batch dimension: [13, num_tokens, 768]
-        token_embeddings_layers = token_embeddings_layers[:, 0, :, :]
-        
-        # Sum last 4 layers for final representation: [num_tokens, 768]
-        token_embeddings = torch.sum(token_embeddings_layers[-4:, :, :], dim = 0)
+        token_embeddings_layers = torch.stack(hidden_states, dim=0)  # 13 layer * batch_size (1) * number of tokens * 768
+        token_embeddings_layers = token_embeddings_layers[:, 0, :, :] # 13 layer * number of tokens * 768
+        token_embeddings = torch.sum(token_embeddings_layers[-4:, :, :], dim = 0) # sum up the last four layers, number of tokens * 768
 
         return token_embeddings
 
-
 class Event_Identification(nn.Module):
-    """
-    Event Identification Model.
-    
-    Predicts whether each word/phrase is an event trigger.
-    Binary classification: event vs non-event.
-    
-    Architecture:
-        - Token embedding (Longformer + BiLSTM)
-        - Word-level averaging of token embeddings
-        - Two-layer classification head: 768 -> 768 -> 2
-    """
+
+    # input: label_event, number of tokens for event identification * 3 (start in input_ids, end in input_ids, label_event)
+    #        event_pairs, number of event pairs * 2 (event 1 row in label_event, event 2 row in label_event)
+    #        label_relation, size = number of event pairs
 
     def __init__(self):
         super(Event_Identification, self).__init__()
 
-        # Longformer encoder
         self.token_embedding = Token_Embedding()
 
-        # BiLSTM for sequential context
         self.bilstm = nn.LSTM(input_size=768, hidden_size=384, batch_first=True, bidirectional=True)
 
-        # Classification head
+
         self.event_head_1 = nn.Linear(768, 768, bias=True)
         nn.init.xavier_uniform_(self.event_head_1.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.event_head_1.bias)
 
-        self.event_head_2 = nn.Linear(768, 2, bias=True)  # Output: [non-event, event]
+        self.event_head_2 = nn.Linear(768, 2, bias=True)
         nn.init.xavier_uniform_(self.event_head_2.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.event_head_2.bias)
 
         self.relu = nn.ReLU()
-        self.crossentropyloss = nn.CrossEntropyLoss(reduction='none')
+        self.crossentropyloss = nn.CrossEntropyLoss(reduction='none') # no reduction
 
 
     def forward(self, input_ids, attention_mask, label_event):
-        """
-        Forward pass for event identification.
-        
-        Args:
-            input_ids: Tokenized input
-            attention_mask: Attention mask
-            label_event: Event labels [num_words, 3] - [start, end, label]
-            
-        Returns:
-            event_weighted_loss: Weighted cross-entropy loss
-            event_raw_scores: Raw logits [num_words, 2]
-        """
-        
-        # Encode tokens using Longformer
-        token_embeddings = self.token_embedding(input_ids, attention_mask)  # [num_tokens, 768]
 
-        # Apply BiLSTM
+        token_embeddings = self.token_embedding(input_ids, attention_mask) # number of tokens * 768
+
+        # token-level bi-lstm layer
         token_embeddings = token_embeddings.view(1, token_embeddings.shape[0], token_embeddings.shape[1])
 
         h0 = torch.zeros(2, 1, 384).cuda().requires_grad_()
         c0 = torch.zeros(2, 1, 384).cuda().requires_grad_()
 
-        token_embeddings, (_, _) = self.bilstm(token_embeddings, (h0, c0))
-        token_embeddings = token_embeddings[0, :, :]  # [num_tokens, 768]
+        token_embeddings, (_, _) = self.bilstm(token_embeddings, (h0, c0)) # batch_size 1 * number of tokens * 768
+        token_embeddings = token_embeddings[0, :, :] # number of tokens * 768
 
-        # Create word embeddings by averaging token embeddings within each word span
+        # event identification task
+        # event_embeddings: embeddings used for event identification, nrow = nrow(label_event), ncol = 768
+
         for token_i in range(label_event.shape[0]):
-            start_in_input_ids = label_event[token_i, 0]
-            end_in_input_ids = label_event[token_i, 1]
-            word_embedding = torch.mean(token_embeddings[start_in_input_ids: end_in_input_ids, :], dim = 0).view(1, 768)
-            
             if token_i == 0:
-                event_embeddings = word_embedding
+                start_in_input_ids = label_event[token_i, 0]
+                end_in_input_ids = label_event[token_i, 1]
+                event_embeddings = torch.mean(token_embeddings[start_in_input_ids: end_in_input_ids, :], dim = 0).view(1, 768)
             else:
-                event_embeddings = torch.cat((event_embeddings, word_embedding), dim = 0)
+                start_in_input_ids = label_event[token_i, 0]
+                end_in_input_ids = label_event[token_i, 1]
+                event_embeddings = torch.cat((event_embeddings, torch.mean(token_embeddings[start_in_input_ids: end_in_input_ids, :], dim = 0).view(1, 768)), dim = 0)
 
-        # Classify each word as event or non-event
-        event_raw_scores = self.event_head_2(self.relu(self.event_head_1(event_embeddings)))
-        event_loss = self.crossentropyloss(event_raw_scores, label_event[:,2])
+        event_raw_scores = self.event_head_2(self.relu(self.event_head_1(event_embeddings))) # nrow = nrow(label_events), ncol = 2
+        event_loss = self.crossentropyloss(event_raw_scores, label_event[:,2]) # size = nrow(label_events)
 
-        # Apply class weights
-        event_loss_weight_0 = (label_event[:, 2] == 0).int()
+        event_loss_weight_0 = (label_event[:, 2] == 0).int() # weight = 1 for negative examples with label_event = 0
         event_loss_0 = torch.mul(event_loss, event_loss_weight_0)
 
-        event_loss_weight_1 = torch.mul(label_event[:,2], event_weight_positive)
+        event_loss_weight_1 = torch.mul(label_event[:,2], event_weight_positive) # weight = event_weight_positive for positive examples with label_event = 1
         event_loss_1 = torch.mul(event_loss, event_loss_weight_1)
 
         event_weighted_loss = torch.add(event_loss_0, event_loss_1)
@@ -268,28 +161,15 @@ class Event_Identification(nn.Module):
 
         return event_weighted_loss, event_raw_scores
 
-
-# ============================================================================
-# Load Pre-trained Event Identification Model
-# ============================================================================
 event_identification = Event_Identification()
 event_identification.cuda()
-# Load best model checkpoint from training
 event_identification.load_state_dict(torch.load('./saved_models/event_relation_graph/best_positive_F_event.ckpt', map_location=device), strict=False)
-event_identification.eval()  # Set to evaluation mode (disables dropout, etc.)
+event_identification.eval()
 
-
-# ============================================================================
-# Event Coreference Model
-# ============================================================================
-# Determines which event mentions refer to the same real-world event.
-# Binary classification for each event pair: coreferent or not.
-# Architecture: Longformer + BiLSTM + 3-layer classification head (768*4 -> 768 -> 256 -> 2)
-# ============================================================================
 
 class Event_Coreference(nn.Module):
 
-    #input: label_event, number of tokens for event identification * 3 (start in input_ids, end in input_ids, label_event)
+    # input: label_event, number of tokens for event identification * 3 (start in input_ids, end in input_ids, label_event)
     #        event_pairs, number of event pairs * 2 (event 1 row in label_event, event 2 row in label_event)
     #        label_relation, size = number of event pairs
 
@@ -474,20 +354,11 @@ class Event_Coreference(nn.Module):
 
         return coreference_weighted_loss, coreference_raw_scores, predicted_coreference_cluster, label_coreference_cluster
 
-# Load pre-trained coreference model
 event_coreference = Event_Coreference()
 event_coreference.cuda()
 event_coreference.load_state_dict(torch.load('./saved_models/event_relation_graph/best_positive_F_coreference.ckpt', map_location=device), strict=False)
 event_coreference.eval()
 
-
-# ============================================================================
-# Event Temporal Relation Model
-# ============================================================================
-# Classifies temporal relationships between event pairs.
-# 4-class classification: none (0), before (1), after (2), overlap (3)
-# Architecture: Longformer + BiLSTM + 3-layer classification head (768*4 -> 768 -> 256 -> 4)
-# ============================================================================
 
 class Event_Temporal(nn.Module):
 
@@ -589,20 +460,11 @@ class Event_Temporal(nn.Module):
 
         return temporal_weighted_loss, temporal_raw_scores
 
-# Load pre-trained temporal relation model
 event_temporal = Event_Temporal()
 event_temporal.cuda()
 event_temporal.load_state_dict(torch.load('./saved_models/event_relation_graph/best_positive_F_temporal.ckpt', map_location=device), strict=False)
 event_temporal.eval()
 
-
-# ============================================================================
-# Event Causal Relation Model
-# ============================================================================
-# Classifies causal relationships between event pairs.
-# 3-class classification: none (0), causes (1), caused_by (2)
-# Architecture: Longformer + BiLSTM + 3-layer classification head (768*4 -> 768 -> 256 -> 3)
-# ============================================================================
 
 class Event_Causal(nn.Module):
 
@@ -699,20 +561,11 @@ class Event_Causal(nn.Module):
 
         return causal_weighted_loss, causal_raw_scores
 
-# Load pre-trained causal relation model
 event_causal = Event_Causal()
 event_causal.cuda()
 event_causal.load_state_dict(torch.load('./saved_models/event_relation_graph/best_positive_F_causal.ckpt', map_location=device), strict=False)
 event_causal.eval()
 
-
-# ============================================================================
-# Event Subevent Relation Model
-# ============================================================================
-# Classifies hierarchical (subevent) relationships between event pairs.
-# 3-class classification: none (0), contains (1), contained_by (2)
-# Architecture: Longformer + BiLSTM + 3-layer classification head (768*4 -> 768 -> 256 -> 3)
-# ============================================================================
 
 class Event_Subevent(nn.Module):
 
@@ -818,30 +671,12 @@ event_subevent.eval()
 
 
 
-# ============================================================================
-# PART 1: BUILD EVENT RELATION GRAPHS FOR BASIL DATASET
-# ============================================================================
-# BASIL (Bias Annotation Spans on the Informational Level) is a media bias
-# dataset with articles from Fox News, NPR, and Huffington Post about the
-# same events. Articles are annotated for informational and lexical bias.
-#
-# Processing Pipeline for Each Article:
-# 1. Load and tokenize the article (title + body sentences)
-# 2. Encode with Longformer and identify event triggers
-# 3. Form all possible event pairs
-# 4. Classify relationships: coreference, temporal, causal, subevent
-# 5. Save article with event graph for downstream bias analysis
-#
-# Output: Event-enriched articles in ./BASIL_event_graph/
-# ============================================================================
-
 ''' build event relation graph on BASIL '''
 
 
 in_file_path = "./BASIL"
 file_names = os.listdir(in_file_path)
 
-# Process each article in BASIL dataset
 for file_idx in range(len(file_names)):
 
     print(file_names[file_idx])
@@ -850,28 +685,20 @@ for file_idx in range(len(file_names)):
         original_article_json = json.load(injson)
 
 
-    # ========================================================================
-    # STEP 1: Tokenize Article (Title + Sentences)
-    # ========================================================================
-    # Create structured representation with metadata and tokenized text.
-    # Each token gets: index, text, event probabilities, and event label.
-    
     ''' tokenize the article '''
 
     article_json = {}
-    # Preserve original BASIL metadata
     article_json['uuid'] = original_article_json['uuid']
     article_json['triplet-uuid'] = original_article_json['triplet-uuid']
-    article_json['media'] = original_article_json['media']  # News source
+    article_json['media'] = original_article_json['media']
     article_json['date'] = original_article_json['date']
     article_json['url'] = original_article_json['url']
     article_json['main-entities'] = original_article_json['main-entities']
     article_json['main-event'] = original_article_json['main-event']
 
     article_json['sentences'] = []
-    index_of_token = 0  # Global token index across all sentences
-    
-    # Deal with the title first (no bias labels)
+    index_of_token = 0
+    # deal with the title first
     sent_dict = {'sentence_id': 'title', 'sentence_text': original_article_json['title'] + '.', 'tokens': [], 'label_info_bias': -1, 'label_info_lex_bias': -1} # title do not have label
     tokens_list = nltk.tokenize.TreebankWordTokenizer().tokenize(sent_dict['sentence_text'])
     for token_i in range(len(tokens_list)):
@@ -879,8 +706,7 @@ for file_idx in range(len(file_names)):
         sent_dict['tokens'].append(token_dict)
         index_of_token += 1
     article_json['sentences'].append(sent_dict)
-    
-    # Then deal with body sentences (with bias annotations)
+    # then deal with sentences
     for sent_i in range(len(original_article_json['basil_sentence_level_annotations'])):
         sent_dict = {'sentence_id': original_article_json['basil_sentence_level_annotations'][sent_i]['sentence_id'],
                      'sentence_text': original_article_json['basil_sentence_level_annotations'][sent_i]['sentence_text'],
@@ -891,13 +717,12 @@ for file_idx in range(len(file_names)):
             sent_dict['tokens'].append(token_dict)
             index_of_token += 1
 
-        # Extract BASIL bias annotations
-        label_info_bias = 0      # Informational bias (framing/context)
-        label_info_lex_bias = 0  # Lexical bias (word choice)
+        label_info_bias = 0
+        label_info_lex_bias = 0
         for ann_i in range(len(original_article_json['basil_sentence_level_annotations'][sent_i]['basil_ann'])):
             if original_article_json['basil_sentence_level_annotations'][sent_i]['basil_ann'][ann_i]['bias'] == 'inf':
                 label_info_bias = 1
-                label_info_lex_bias = 1  # Informational bias implies lexical
+                label_info_lex_bias = 1
             if original_article_json['basil_sentence_level_annotations'][sent_i]['basil_ann'][ann_i]['bias'] == 'lex':
                 label_info_lex_bias = 1
 
@@ -907,12 +732,6 @@ for file_idx in range(len(file_names)):
         article_json['sentences'].append(sent_dict)
 
 
-    # ========================================================================
-    # STEP 2: Event Identification
-    # ========================================================================
-    # Encode the article with Longformer and predict which tokens are events.
-    # Uses a threshold of 0.5 on P(event) to classify tokens.
-    
     ''' event identification '''
 
     input_ids = []
@@ -1464,64 +1283,6 @@ for file_idx in range(len(file_names)):
 
 
 
-
-
-
-# ============================================================================
-# END OF EVENT GRAPH EXTRACTION SCRIPT
-# ============================================================================
-#
-# Summary of What This Script Does:
-#
-# 1. LOADS PRETRAINED MODELS:
-#    - Event Identification: Detects which words/phrases are events
-#    - Event Coreference: Links mentions of the same event
-#    - Temporal Relations: Determines time ordering (before/after/overlap)
-#    - Causal Relations: Identifies cause-effect relationships
-#    - Subevent Relations: Finds hierarchical event structures
-#
-# 2. PROCESSES TWO MEDIA BIAS DATASETS:
-#    
-#    A. BASIL Dataset:
-#       - News articles from Fox News, NPR, and Huffington Post
-#       - Same events covered by different news sources
-#       - Annotated for informational and lexical bias
-#       - Output: ./BASIL_event_graph/
-#    
-#    B. BiasedSents Dataset:
-#       - Sentences from various news sources
-#       - Annotated for bias at sentence level
-#       - Output: ./BiasedSents_event_graph/
-#
-# 3. FOR EACH ARTICLE:
-#    - Tokenizes text using NLTK TreebankWordTokenizer
-#    - Encodes with Longformer transformer
-#    - Identifies event triggers (threshold: P(event) > 0.5)
-#    - Forms all possible event pairs
-#    - Classifies each pair for all relation types
-#    - Saves enriched article with complete event relation graph
-#
-# 4. OUTPUT STRUCTURE:
-#    Each output JSON contains:
-#    - Original article metadata and text
-#    - Tokenized sentences with event probabilities
-#    - List of detected event tokens
-#    - Event pairs with relation predictions:
-#      * Coreference probabilities [P(not_coref), P(coref)]
-#      * Temporal probabilities [P(none), P(before), P(after), P(overlap)]
-#      * Causal probabilities [P(none), P(causes), P(caused_by)]
-#      * Subevent probabilities [P(none), P(contains), P(contained_by)]
-#
-# 5. DOWNSTREAM USE:
-#    These event graphs enable:
-#    - Analyzing how different sources frame the same events
-#    - Detecting bias through event selection and presentation
-#    - Training bias classifiers using event-based features
-#    - Comparing event narratives across political spectrum
-#
-# The event graphs capture the "who did what to whom, when, why" structure
-# of news articles, which is crucial for understanding media bias.
-# ============================================================================
 
 
 

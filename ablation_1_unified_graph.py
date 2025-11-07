@@ -17,8 +17,9 @@ import datetime
 import argparse
 from pathlib import Path
 import math
-import multiprocessing as mp
+import torch.multiprocessing as mp
 from tqdm import tqdm
+import logging
 
 
 from torch.utils.data import Dataset, DataLoader
@@ -68,6 +69,8 @@ def parse_arguments():
                        help='Directory containing classified event graphs')
     parser.add_argument('--results_dir', type=str, default='./results_ablation_1',
                        help='Directory to save results')
+    parser.add_argument('--log_dir', type=str, default='/scratch/atharv.johar/logs',
+                       help='Directory to save log files')
     
     # Other options
     parser.add_argument('--seed', type=int, default=42,
@@ -130,8 +133,6 @@ print("="*70 + "\n")
 MAX_LEN = args.max_len
 num_epochs = args.epochs
 batch_size = args.batch_size
-
-CLASS_WEIGHTS = torch.tensor([1.0, 3.0]).to(device)
 
 lambda_event = 1.0
 lambda_coreference = 1.0
@@ -279,6 +280,45 @@ def detect_paragraphs_heuristic(sentences):
 
 def format_time(elapsed):
     return str(datetime.timedelta(seconds=int(round(elapsed))))
+
+def setup_logger(fold_idx, log_dir):
+    """
+    Setup logger for a specific fold
+    Creates both file and console handlers
+    """
+    # Create log directory if it doesn't exist
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Create logger
+    logger = logging.getLogger(f'fold_{fold_idx}')
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    logger.handlers = []
+    
+    # Create file handler
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = f"{log_dir}/ablation_1_fold_{fold_idx}_{timestamp}.log"
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.INFO)
+    
+    # Create console handler (optional, for critical messages)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - Fold %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger, log_file
 
 # ==================== DATASET ====================
 
@@ -719,10 +759,15 @@ class Dual_View_Model(nn.Module):
     ABLATION 1: No Dual-View (Unified Graph)
     All events are processed by a single GNN.
     """
-    def __init__(self):
+    def __init__(self, class_weights=None):
         super(Dual_View_Model, self).__init__()
         feature_dim = 768
         self.feature_dim = feature_dim
+        
+        # Store class weights as a buffer (not a parameter)
+        if class_weights is None:
+            class_weights = torch.tensor([1.0, 3.0])
+        self.register_buffer('class_weights', class_weights)
         
         self.token_embedding = Token_Embedding()
         self.bilstm_token = nn.LSTM(input_size=feature_dim, hidden_size=feature_dim//2, 
@@ -790,7 +835,8 @@ class Dual_View_Model(nn.Module):
         
         self.relu = nn.ReLU()
         self.crossentropyloss = nn.CrossEntropyLoss(reduction='mean')
-        self.crossentropyloss_sum = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS, reduction='sum')
+        # Note: class_weights will be set via register_buffer in __init__
+        self.crossentropyloss_sum = nn.CrossEntropyLoss(weight=None, reduction='sum')
         
     def build_paragraph_adjacency_with_coref(self, N_para, event_words, event_pairs, label_coreference, current_device):
         """
@@ -977,7 +1023,9 @@ class Dual_View_Model(nn.Module):
                    contrastive_loss)
         
         bias_scores = self.bias_sentence_2(self.relu(self.bias_sentence_1(final_sent_emb)))
-        bias_loss = self.crossentropyloss_sum(bias_scores, label_bias)
+        # Apply class weights manually since we can't set them in __init__ for multiprocessing
+        loss_fn = nn.CrossEntropyLoss(weight=self.class_weights, reduction='sum')
+        bias_loss = loss_fn(bias_scores, label_bias)
 
         return (bias_scores, label_bias, bias_loss, 
                 event_loss, coreference_loss, temporal_loss, causal_loss, subevent_loss,
@@ -1023,6 +1071,16 @@ def train_one_fold(fold_idx, folders):
     
     current_device = get_device(fold_idx % args.gpu_num)
     
+    # Setup logger for this fold
+    logger, log_file = setup_logger(fold_idx, args.log_dir)
+    
+    logger.info("="*70)
+    logger.info(f"STARTING FOLD {fold_idx}/{args.n_folds-1} on {current_device}")
+    logger.info("="*70)
+    logger.info(f"Log file: {log_file}")
+    logger.info(f"Device: {current_device}")
+    logger.info(f"Random seed: {args.seed}")
+    
     print(f"\n{'='*70}")
     print(f"STARTING FOLD {fold_idx}/{args.n_folds-1} on {current_device}")
     print(f"{'='*70}\n")
@@ -1044,10 +1102,17 @@ def train_one_fold(fold_idx, folders):
         if j != dev_idx and j != test_idx:
             train_files.extend(folders[j])
 
-    model = Dual_View_Model()
+    logger.info(f"Training files: {len(train_files)}")
+    logger.info(f"Dev files: {len(dev_files)}")
+    logger.info(f"Test files: {len(test_files)}")
+
+    # Create class weights on the correct device
+    class_weights = torch.tensor([1.0, 3.0]).to(current_device)
+    model = Dual_View_Model(class_weights=class_weights)
     model.to(current_device)
-    global CLASS_WEIGHTS
-    CLASS_WEIGHTS = torch.tensor([1.0, 3.0]).to(current_device)
+    
+    logger.info(f"Model created and moved to {current_device}")
+    logger.info(f"Class weights: {class_weights.tolist()}")
 
 
     param_all = list(model.named_parameters())
@@ -1076,9 +1141,23 @@ def train_one_fold(fold_idx, folders):
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, 
                                                 num_training_steps=num_train_steps)
 
+    logger.info(f"Total training steps: {num_train_steps}")
+    logger.info(f"Warmup steps: {warmup_steps}")
+    logger.info(f"Epochs: {num_epochs}")
+    logger.info(f"Learning rates - Longformer: {longformer_lr}, Non-Longformer: {non_longformer_lr}")
+
     best_dev_f1 = 0
+    
+    logger.info("\n" + "="*70)
+    logger.info("STARTING TRAINING")
+    logger.info("="*70)
 
     for epoch_i in range(num_epochs):
+        epoch_start_time = time.time()
+        logger.info(f"\n{'='*50}")
+        logger.info(f"EPOCH {epoch_i+1}/{num_epochs}")
+        logger.info(f"{'='*50}")
+        
         np.random.shuffle(train_files)
         train_dataset = custom_dataset(train_files)
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
@@ -1092,7 +1171,8 @@ def train_one_fold(fold_idx, folders):
             total=len(train_dataloader), 
             desc=f"[Fold {fold_idx} on {current_device}] Epoch {epoch_i+1}/{num_epochs}", 
             ncols=100,
-            disable=(fold_idx % args.gpu_num != 0)
+            position=fold_idx,
+            leave=False
         )
         
         with progress_bar as pbar:
@@ -1135,18 +1215,60 @@ def train_one_fold(fold_idx, folders):
                 })
                 pbar.update(1)
 
+        # Calculate epoch metrics
+        epoch_time = time.time() - epoch_start_time
+        avg_bias_loss = total_bias / num_batch if num_batch > 0 else 0
+        avg_distill_loss = total_distill / num_batch if num_batch > 0 else 0
+        
+        logger.info(f"Epoch {epoch_i+1} completed in {format_time(epoch_time)}")
+        logger.info(f"  Avg Bias Loss: {avg_bias_loss:.4f}")
+        logger.info(f"  Avg Distill Loss: {avg_distill_loss:.4f}")
+        logger.info(f"  Batches processed: {num_batch}/{len(train_dataloader)}")
+
         # Save checkpoint based on dev F1
+        logger.info("Evaluating on dev set...")
         precision, recall, dev_f1, _, _, _ = evaluate(model, dev_dataloader)
+        
+        logger.info(f"Dev Results - P: {precision:.4f}, R: {recall:.4f}, F1: {dev_f1:.4f}")
         
         if dev_f1 > best_dev_f1:
             best_dev_f1 = dev_f1
-            torch.save(model.state_dict(), f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt")
+            checkpoint_path = f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt"
+            torch.save(model.state_dict(), checkpoint_path)
+            logger.info(f"✓ New best F1! Saved checkpoint to {checkpoint_path}")
+        else:
+            logger.info(f"  (Best F1 remains: {best_dev_f1:.4f})")
+
+    logger.info("\n" + "="*70)
+    logger.info("TRAINING COMPLETED")
+    logger.info("="*70)
+    logger.info(f"Best Dev F1: {best_dev_f1:.4f}")
 
     # Test
+    logger.info("\nLoading best model for testing...")
     model.load_state_dict(torch.load(f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt", map_location=current_device))
+    logger.info("Evaluating on test set...")
     precision, recall, test_f1, macro_f1, test_dec, test_lab = evaluate(model, test_dataloader)
 
+    logger.info("\n" + "="*70)
+    logger.info("FINAL TEST RESULTS")
+    logger.info("="*70)
+    logger.info(f"Precision: {precision:.4f}")
+    logger.info(f"Recall:    {recall:.4f}")
+    logger.info(f"F1 Score:  {test_f1:.4f}")
+    logger.info(f"Macro F1:  {macro_f1:.4f}")
+    logger.info("="*70)
+
     print(f"[Fold {fold_idx} on {current_device}] TEST: P={precision:.4f}, R={recall:.4f}, F1={test_f1:.4f}")
+    
+    # Log predictions distribution
+    unique, counts = np.unique(test_dec, return_counts=True)
+    logger.info(f"Prediction distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
+    unique, counts = np.unique(test_lab, return_counts=True)
+    logger.info(f"Label distribution: {dict(zip(unique.tolist(), counts.tolist()))}")
+    
+    logger.info(f"\nLog file saved to: {log_file}")
+    logger.info("Fold complete!")
 
     return {
         'fold': fold_idx,
@@ -1155,7 +1277,8 @@ def train_one_fold(fold_idx, folders):
         'f1': float(test_f1),
         'macro_f1': float(macro_f1),
         'predictions': test_dec.tolist(),
-        'labels': test_lab.tolist()
+        'labels': test_lab.tolist(),
+        'log_file': log_file
     }
 
 # ==================== MAIN EXECUTION ====================
@@ -1166,6 +1289,9 @@ def run_fold_on_gpu(fold_i, folders):
 
 
 if __name__ == "__main__":
+    # Create log directory at startup
+    Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+    
     print("\n" + "="*70)
     print("ABLATION 1: NO DUAL-VIEW (UNIFIED GRAPH)")
     print("="*70 + "\n")
@@ -1180,8 +1306,16 @@ if __name__ == "__main__":
     n_folds_for_split = 3 if args.debug else 10
     folders = create_cv_folds_triplet_aware(available_files, n_folds=n_folds_for_split, seed=args.seed)
     
+    print(f"Logs will be saved to: {args.log_dir}")
+    print(f"Results will be saved to: {RESULTS_DIR}\n")
+    
     # ---- PARALLEL FOLD TRAINING ACROSS MULTIPLE GPUS ----
-    mp.set_start_method("spawn", force=True)
+    # Use spawn method for CUDA compatibility
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # Already set
+    
     pool = mp.Pool(processes=args.gpu_num)
 
     pool_args = [(fold_i, folders) for fold_i in range(args.n_folds)]
@@ -1216,6 +1350,7 @@ if __name__ == "__main__":
         'n_folds': args.n_folds,
         'n_files': len(available_files),
         'method': 'Ablation 1: No Dual-View (Unified Graph)',
+        'log_directory': args.log_dir,
         'hyperparameters': {
             'epochs': args.epochs,
             'batch_size': args.batch_size,
@@ -1243,3 +1378,10 @@ if __name__ == "__main__":
     print(f"Precision: {avg_precision:.4f} ± {std_precision:.4f}")
     print(f"Recall:    {avg_recall:.4f} ± {std_recall:.4f}")
     print(f"F1:        {avg_f1:.4f} ± {std_f1:.4f}")
+    print("="*70)
+    print(f"All logs saved to: {args.log_dir}")
+    print("Individual fold logs:")
+    for fold_result in all_fold_results:
+        if 'log_file' in fold_result:
+            print(f"  Fold {fold_result['fold']}: {fold_result['log_file']}")
+    print("="*70 + "\n")

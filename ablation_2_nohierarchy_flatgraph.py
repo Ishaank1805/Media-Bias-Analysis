@@ -1,9 +1,9 @@
-
 #!/usr/bin/env python3
 """
-Two-Level Dual-View Hierarchical GNN for Media Bias Detection
-COMPLETE VERSION with ALL Research-Backed Innovations + CLI Arguments for Testing
-Now with multi-GPU parallel fold execution.
+Ablation 2: No Hierarchy (Flat Graph)
+This model removes the "Two-Level" (paragraph + document) structure.
+It processes all events in a document-wide "flat" graph and feeds the
+updated event aggregations directly to the classifier.
 """
 
 import os
@@ -26,7 +26,7 @@ from transformers import LongformerTokenizer, LongformerModel
 from transformers import get_linear_schedule_with_warmup
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import precision_recall_fscore_support, classification_report, confusion_matrix
+from sklearn.metrics import precision_recall_fscore_support, classification_report
 
 # Try to import sentence-transformers for semantic paragraph detection
 try:
@@ -41,7 +41,7 @@ except ImportError:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='Two-Level Dual-View GNN for Media Bias Detection',
+        description='Ablation 2: Flat Graph GNN for Media Bias Detection',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -68,7 +68,7 @@ def parse_arguments():
     # Paths
     parser.add_argument('--data_dir', type=str, default='./BASIL_event_graph_classified',
                        help='Directory containing classified event graphs')
-    parser.add_argument('--results_dir', type=str, default='./results',
+    parser.add_argument('--results_dir', type=str, default='./results_ablation_2',
                        help='Directory to save results')
     
     # Other options
@@ -91,7 +91,7 @@ def parse_arguments():
         print("   - Limiting to first 30 files\n")
         args.n_folds = 1
         args.epochs = 3
-        args.max_files = 30  # Increased to ensure training data
+        args.max_files = 30
     
     return args
 
@@ -112,7 +112,7 @@ RESULTS_DIR = args.results_dir
 Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
 
 print("="*70)
-print("TWO-LEVEL DUAL-VIEW WITH ADVANCED FEATURES")
+print("ABLATION 2: NO HIERARCHY (FLAT GRAPH)")
 print("="*70)
 if torch.cuda.is_available():
     print(f"Available GPUs: {torch.cuda.device_count()}")
@@ -140,7 +140,7 @@ lambda_coreference = 1.0
 lambda_temporal = 1.0
 lambda_causal = 1.0
 lambda_subevent = 1.0
-lambda_contrastive = args.contrastive_weight
+lambda_contrastive = args.contrastive_weight # Keep contrastive loss, but applied at document level
 
 no_decay = ['bias', 'LayerNorm.weight']
 longformer_weight_decay = 1e-2
@@ -211,8 +211,8 @@ def create_cv_folds_triplet_aware(file_list, n_folds=10, seed=42):
 
 def detect_paragraphs_semantic(sentences):
     """
-    INNOVATION 1: Semantic paragraph detection using sentence embeddings
-    Detects topic shifts instead of using arbitrary windows
+    Paragraph detection is still needed by the Dataset loader,
+    but the model's logic will ignore it.
     """
     if not SEMANTIC_AVAILABLE or args.no_semantic:
         return detect_paragraphs_heuristic(sentences)
@@ -488,7 +488,7 @@ class custom_dataset(Dataset):
             "label_subevent": label_subevent
         }
 
-# ==================== INNOVATIONS ====================
+# ==================== INNOVATIONS (Modified for Ablation) ====================
 
 class AdaptiveEdgeDropout(nn.Module):
     """
@@ -617,10 +617,55 @@ class DualViewContrastiveLoss(nn.Module):
 class Token_Embedding(nn.Module):
     def __init__(self):
         super(Token_Embedding, self).__init__()
-        self.longformermodel = LongformerModel.from_pretrained(
-            'allenai/longformer-base-4096', output_hidden_states=True)
+        # Serialize concurrent downloads/writes to the HF cache across
+        # multiprocessing workers to avoid cache IO spikes and duplicated
+        # partial files that can cause errors. This simple lock-file
+        # approach waits if another process is currently downloading.
+        lockfile = '/tmp/longformer_download.lock'
+        wait_time = 0
+        while os.path.exists(lockfile):
+            # another process is downloading/loading the weights
+            time.sleep(1)
+            wait_time += 1
+            # safety timeout (avoid waiting forever)
+            if wait_time > 300:
+                break
+
+        try:
+            # create lock
+            try:
+                open(lockfile, 'x').close()
+            except Exception:
+                # if creation fails, proceed — another process likely created it
+                pass
+
+            # Load model (will use local cache if already downloaded)
+            self.longformermodel = LongformerModel.from_pretrained(
+                'allenai/longformer-base-4096', output_hidden_states=True)
+        finally:
+            try:
+                if os.path.exists(lockfile):
+                    os.remove(lockfile)
+            except Exception:
+                pass
+
+        # Enable gradient checkpointing on the Longformer to reduce peak
+        # GPU memory usage at training time (trades compute for memory).
+        try:
+            # this API may not be available on very old `transformers` versions
+            self.longformermodel.gradient_checkpointing_enable()
+        except Exception:
+            # not fatal — we still proceed without checkpointing
+            pass
 
     def forward(self, input_ids, attention_mask):
+        # Ensure the tensors are on the same device as the Longformer model
+        device = next(self.longformermodel.parameters()).device
+        if input_ids is not None:
+            input_ids = input_ids.to(device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
         outputs = self.longformermodel(input_ids=input_ids, attention_mask=attention_mask)
         hidden_states = outputs[2]
         token_embeddings_layers = torch.stack(hidden_states, dim=0)
@@ -758,36 +803,14 @@ class Cross_View_Attention(nn.Module):
         return F_updated, I_updated
 
 
-class GAT_Layer(nn.Module):
-    """Document-level paragraph GAT"""
-    def __init__(self, feature_dim):
-        super(GAT_Layer, self).__init__()
-        self.feature_dim = feature_dim
-        self.W = nn.Linear(feature_dim, feature_dim)
-        self.a = nn.Linear(feature_dim * 2, 1)
-        self.leakyrelu = nn.LeakyReLU(0.2)
-
-    def forward(self, node_embeddings, adj_matrix):
-        N = node_embeddings.size(0)
-        if N <= 1:
-            return node_embeddings
-
-        H = self.W(node_embeddings)
-        H_i = H.repeat(1, N).view(N * N, self.feature_dim)
-        H_j = H.repeat(N, 1)
-        attention_input = torch.cat([H_i, H_j], dim=1)
-        e = self.a(attention_input).view(N, N)
-        e = e.masked_fill(adj_matrix == 0, float('-inf'))
-        attention_weights = F.softmax(self.leakyrelu(e), dim=1)
-        new_embeddings = attention_weights @ H
-        return new_embeddings
-
-
-# ==================== MAIN MODEL ====================
+# ==================== MAIN MODEL (Ablation 2) ====================
 
 class Dual_View_Model(nn.Module):
     """
-    Complete model with ALL innovations
+    ABLATION 2: No Hierarchy (Flat Graph)
+    - Removes paragraph loop
+    - Removes Document GAT
+    - Classifier input is [sentence_emb, event_agg (from flat GNN)]
     """
     def __init__(self):
         super(Dual_View_Model, self).__init__()
@@ -798,7 +821,7 @@ class Dual_View_Model(nn.Module):
         self.bilstm_token = nn.LSTM(input_size=feature_dim, hidden_size=feature_dim//2, 
                                      batch_first=True, bidirectional=True)
         
-        # Soft distillation heads
+        # Soft distillation heads (unchanged)
         self.event_head_1 = nn.Linear(feature_dim, feature_dim, bias=True)
         nn.init.xavier_uniform_(self.event_head_1.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.event_head_1.bias)
@@ -834,86 +857,67 @@ class Dual_View_Model(nn.Module):
         nn.init.xavier_uniform_(self.subevent_head_2.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.subevent_head_2.bias)
         
-        # INNOVATIONS
+        # Innovations (partially kept)
         self.adaptive_dropout = AdaptiveEdgeDropout(edge_dropout_rate)
         self.F_pooling = MultiScaleAttentionPooling(feature_dim, num_heads=4)
         self.I_pooling = MultiScaleAttentionPooling(feature_dim, num_heads=4)
         self.contrastive_loss = DualViewContrastiveLoss(temperature=0.07)
         
-        # Dual-view components
+        # Dual-view components (kept for flat processing)
         self.R_GAT_Factual = R_GAT_Layer(feature_dim)
         self.R_GAT_Interpretive = R_GAT_Layer(feature_dim)
         self.Cross_View_Attn = Cross_View_Attention(feature_dim)
-        self.paragraph_agg = nn.Linear(feature_dim * 2, feature_dim)
-        self.GAT_Document = GAT_Layer(feature_dim)
         
-        # Classifier
-        self.bias_sentence_1 = nn.Linear(feature_dim * 3, feature_dim, bias=True)
+        # --- ABLATION CHANGES ---
+        # 1. Removed paragraph_agg
+        # 2. Removed GAT_Document
+        # 3. Changed classifier input dim to feature_dim * 2
+        
+        self.bias_sentence_1 = nn.Linear(feature_dim * 2, feature_dim, bias=True)
         nn.init.xavier_uniform_(self.bias_sentence_1.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.bias_sentence_1.bias)
         self.bias_sentence_2 = nn.Linear(feature_dim, 2, bias=True)
         nn.init.xavier_uniform_(self.bias_sentence_2.weight, gain=nn.init.calculate_gain('relu'))
         nn.init.zeros_(self.bias_sentence_2.bias)
+        # --- END ABLATION CHANGES ---
         
         self.relu = nn.ReLU()
         self.crossentropyloss = nn.CrossEntropyLoss(reduction='mean')
         self.crossentropyloss_sum = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS, reduction='sum')
         
-    def build_paragraph_adjacency_with_coref(self, N_para, event_words, event_pairs, label_coreference):
-        """
-        INNOVATION 4: Cross-paragraph coreference links
-        Connect paragraphs that discuss the same events
-        """
-        adj = torch.eye(N_para).to(device)
-        
-        # Sequential connections
-        if N_para > 1:
-            for i in range(N_para - 1):
-                adj[i, i+1] = 1
-                adj[i+1, i] = 1
-        
-        # Coreference connections (cross-paragraph)
-        if event_pairs.size(0) > 0 and label_coreference.size(0) > 0:
-            coref_mask = (label_coreference[:, 2] == 1).nonzero(as_tuple=True)[0]
-            
-            if coref_mask.size(0) > 0:
-                coref_pairs = event_pairs[coref_mask]
-                
-                for pair in coref_pairs:
-                    if pair[0] < event_words.size(0) and pair[1] < event_words.size(0):
-                        para1 = int(event_words[pair[0], 8])
-                        para2 = int(event_words[pair[1], 8])
-                        
-                        if para1 < N_para and para2 < N_para and para1 != para2:
-                            adj[para1, para2] = 1
-                            adj[para2, para1] = 1
-        
-        return adj
-        
     def forward(self, batch):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        label_sentence = batch['label_sentence'][0].to(device)
-        event_words = batch['event_words'][0].to(device)
-        event_pairs = batch['event_pairs'][0].to(device)
-        label_coreference = batch['label_coreference'][0].to(device)
-        label_temporal = batch['label_temporal'][0].to(device)
-        label_causal = batch['label_causal'][0].to(device)
-        label_subevent = batch['label_subevent'][0].to(device)
+        # 1. Determine device from the model parameters to ensure consistency
+        # between created tensors (hidden states) and inputs that may be moved
+        # inside Token_Embedding.
+        current_device = next(self.parameters()).device
+
+        # 2. Move data to the correct device
+        input_ids = batch['input_ids'].to(current_device)
+        attention_mask = batch['attention_mask'].to(current_device)
+        label_sentence = batch['label_sentence'][0].to(current_device)
+        event_words = batch['event_words'][0].to(current_device)
+        event_pairs = batch['event_pairs'][0].to(current_device)
+        label_coreference = batch['label_coreference'][0].to(current_device)
+        label_temporal = batch['label_temporal'][0].to(current_device)
+        label_causal = batch['label_causal'][0].to(current_device)
+        label_subevent = batch['label_subevent'][0].to(current_device)
+        
+        # 3. Create dummy loss tensors on the correct device
+        dummy_loss = torch.tensor(0.0).to(current_device)
         
         # Token encoding
         token_embeddings = self.token_embedding(input_ids, attention_mask)
         token_embeddings = token_embeddings.view(1, token_embeddings.shape[0], token_embeddings.shape[1])
-        
-        h0 = torch.zeros(2, 1, self.feature_dim//2).to(device).requires_grad_()
-        c0 = torch.zeros(2, 1, self.feature_dim//2).to(device).requires_grad_()
+
+        device_tok = token_embeddings.device
+        h0 = torch.zeros(2, 1, self.feature_dim//2, device=device_tok).requires_grad_()
+        c0 = torch.zeros(2, 1, self.feature_dim//2, device=device_tok).requires_grad_()
         token_embeddings, _ = self.bilstm_token(token_embeddings, (h0, c0))
         token_embeddings = token_embeddings[0, :, :]
         
         sent_start_indices = label_sentence[:, 0].long()
         sentence_embeddings = token_embeddings[sent_start_indices]
         
-        # INNOVATION: Adaptive edge dropout during training
         relation_probs = {
             'coref': label_coreference,
             'temporal': label_temporal,
@@ -951,89 +955,73 @@ class Dual_View_Model(nn.Module):
                 sub_scores = self.subevent_head_2(self.relu(self.subevent_head_1(event_pair_emb)))
                 subevent_loss = self.crossentropyloss(sub_scores, label_subevent[:, :3])
             else:
-                coreference_loss = torch.tensor(0.0).to(device)
-                temporal_loss = torch.tensor(0.0).to(device)
-                causal_loss = torch.tensor(0.0).to(device)
-                subevent_loss = torch.tensor(0.0).to(device)
+                coreference_loss = dummy_loss
+                temporal_loss = dummy_loss
+                causal_loss = dummy_loss
+                subevent_loss = dummy_loss
         else:
-            event_embeddings = torch.zeros((0, self.feature_dim)).to(device)
-            event_loss = torch.tensor(0.0).to(device)
-            coreference_loss = torch.tensor(0.0).to(device)
-            temporal_loss = torch.tensor(0.0).to(device)
-            causal_loss = torch.tensor(0.0).to(device)
-            subevent_loss = torch.tensor(0.0).to(device)
+            event_embeddings = torch.zeros((0, self.feature_dim)).to(current_device)
+            event_loss = dummy_loss
+            coreference_loss = dummy_loss
+            temporal_loss = dummy_loss
+            causal_loss = dummy_loss
+            subevent_loss = dummy_loss
         
-        # LEVEL 1: Paragraph-level dual-view
-        unique_paras = torch.unique(label_sentence[:, 4])
-        para_reps = torch.zeros((len(unique_paras), self.feature_dim)).to(device)
         
-        # For contrastive learning: collect F/I summaries per sentence
-        sentence_F_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(device)
-        sentence_I_summaries = torch.zeros((sentence_embeddings.size(0), self.feature_dim)).to(device)
+        # --- ABLATION 2: FLAT GRAPH (NO HIERARCHY) ---
         
-        for p_idx, p_id in enumerate(unique_paras):
-            p_mask = (event_words[:, 8] == p_id).nonzero(as_tuple=True)[0]
-            
-            if p_mask.size(0) == 0:
-                sent_mask = (label_sentence[:, 4] == p_id).nonzero(as_tuple=True)[0]
-                if sent_mask.size(0) > 0:
-                    para_reps[p_idx] = torch.mean(sentence_embeddings[sent_mask], dim=0)
-                continue
-            
-            para_events = event_embeddings[p_mask]
-            
-            F_mask = (event_words[p_mask, 7] == 0).nonzero(as_tuple=True)[0]
-            I_mask = (event_words[p_mask, 7] == 1).nonzero(as_tuple=True)[0]
-            
-            F_events = para_events[F_mask] if F_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(device)
-            I_events = para_events[I_mask] if I_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(device)
+        # 1. Remove paragraph loop. Process all events at document level.
+        if event_embeddings.size(0) > 0:
+            F_mask = (event_words[:, 7] == 0).nonzero(as_tuple=True)[0]
+            I_mask = (event_words[:, 7] == 1).nonzero(as_tuple=True)[0]
 
-            # Use filtered edges
+            F_events = event_embeddings[F_mask] if F_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(current_device)
+            I_events = event_embeddings[I_mask] if I_mask.size(0) > 0 else torch.zeros((0, self.feature_dim)).to(current_device)
+
+            # 2. Run GNNs on flat document-level event lists
             F_updated = self.R_GAT_Factual(F_events, event_pairs_filtered, relation_probs_filtered)
             I_updated = self.R_GAT_Interpretive(I_events, event_pairs_filtered, relation_probs_filtered)
-            
+
+            # 3. Run Cross-View Attention
             F_final, I_final = self.Cross_View_Attn(F_updated, I_updated)
+
+            # 4. Create the updated event embedding tensor
+            updated_event_embeddings = event_embeddings.clone()
+            if F_mask.size(0) > 0:
+                updated_event_embeddings[F_mask] = F_final
+            if I_mask.size(0) > 0:
+                updated_event_embeddings[I_mask] = I_final
             
-            # INNOVATION: Multi-scale attention pooling instead of mean
-            F_summary = self.F_pooling(F_final)
-            I_summary = self.I_pooling(I_final)
-            
-            para_reps[p_idx] = F.relu(self.paragraph_agg(torch.cat([F_summary, I_summary], dim=0)))
-            
-            # Store F/I summaries for each sentence in this paragraph
-            sent_in_para = (label_sentence[:, 4] == p_id).nonzero(as_tuple=True)[0]
-            for sent_idx in sent_in_para:
-                sentence_F_summaries[sent_idx] = F_summary
-                sentence_I_summaries[sent_idx] = I_summary
+            # 5. Run Contrastive Loss (at document level)
+            # Pool all F and I events for a single document-level contrastive loss
+            F_summary_doc = self.F_pooling(F_final)
+            I_summary_doc = self.I_pooling(I_final)
+            contrastive_loss = self.contrastive_loss(F_summary_doc.unsqueeze(0), I_summary_doc.unsqueeze(0))
+
+        else:
+            updated_event_embeddings = event_embeddings
+            contrastive_loss = dummy_loss 
         
-        # INNOVATION: Contrastive loss between F and I views
-        contrastive_loss = self.contrastive_loss(sentence_F_summaries, sentence_I_summaries)
+        # 6. Remove LEVEL 2 (GAT_Document)
         
-        # LEVEL 2: Document-level with cross-paragraph coreference
-        N_para = para_reps.size(0)
-        
-        # INNOVATION: Adjacency with coreference links
-        adj_doc = self.build_paragraph_adjacency_with_coref(
-            N_para, event_words, event_pairs, label_coreference
-        )
-        
-        updated_para_reps = self.GAT_Document(para_reps, adj_doc)
-        
-        # Map to sentences
-        sent_to_para = label_sentence[:, 4].long()
-        para_context = updated_para_reps[sent_to_para]
-        
-        # Event aggregation
-        event_agg = torch.zeros_like(sentence_embeddings).to(device)
+        # 7. Modify Event Aggregation to use GNN-updated embeddings
+        event_agg = torch.zeros_like(sentence_embeddings).to(current_device)
         if event_words.size(0) > 0:
             min_sent = int(event_words[:, 2].min())
             max_sent = int(event_words[:, 2].max())
             for sent_idx in range(min_sent, max_sent + 1):
+                if sent_idx >= event_agg.size(0): 
+                    break
                 event_mask = (event_words[:, 2] == sent_idx).nonzero(as_tuple=True)[0]
                 if event_mask.size(0) > 0:
-                    event_agg[sent_idx] = torch.mean(event_embeddings[event_mask], dim=0)
+                    # Use the GNN-updated embeddings here
+                    event_agg[sent_idx] = torch.mean(updated_event_embeddings[event_mask], dim=0)
+
+        # 8. Modify Final Classifier Input (dim * 2)
+        # No para_context
+        final_sent_emb = torch.cat([sentence_embeddings, event_agg], dim=1)
         
-        final_sent_emb = torch.cat([sentence_embeddings, para_context, event_agg], dim=1)
+        # --- END ABLATION ---
         
         label_bias = label_sentence[:, 3].long()
         if label_bias[0] == -1:
@@ -1041,8 +1029,8 @@ class Dual_View_Model(nn.Module):
             final_sent_emb = final_sent_emb[1:, :]
         
         if label_bias.size(0) == 0 or (label_bias < 0).any() or (label_bias > 1).any():
-            return (torch.zeros((1, 2)).to(device), label_bias, 
-                   torch.tensor(0.0).to(device), event_loss,
+            return (torch.zeros((1, 2)).to(current_device), label_bias, 
+                   dummy_loss, event_loss,
                    coreference_loss, temporal_loss, causal_loss, subevent_loss,
                    contrastive_loss)
         
@@ -1091,8 +1079,10 @@ def evaluate(model, eval_dataloader):
 def train_one_fold(fold_idx, folders):
     """Train and test a single fold"""
     
+    current_device = get_device(fold_idx % args.gpu_num)
+    
     print(f"\n{'='*70}")
-    print(f"FOLD {fold_idx}/{args.n_folds-1}")
+    print(f"STARTING FOLD {fold_idx}/{args.n_folds-1} on {current_device}")
     print(f"{'='*70}\n")
     
     seed_val = args.seed
@@ -1112,10 +1102,11 @@ def train_one_fold(fold_idx, folders):
         if j != dev_idx and j != test_idx:
             train_files.extend(folders[j])
 
-    print(f"[Fold {fold_idx}] Train: {len(train_files)}, Dev: {len(dev_files)}, Test: {len(test_files)}")
-
     model = Dual_View_Model()
-    model.to(device)
+    model.to(current_device)
+    global CLASS_WEIGHTS
+    CLASS_WEIGHTS = torch.tensor([1.0, 3.0]).to(current_device)
+
 
     param_all = list(model.named_parameters())
     optimizer_grouped_parameters = [
@@ -1145,20 +1136,25 @@ def train_one_fold(fold_idx, folders):
 
     best_dev_f1 = 0
 
-    # ✅ tqdm progress bar loop
     for epoch_i in range(num_epochs):
         np.random.shuffle(train_files)
         train_dataset = custom_dataset(train_files)
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
             
         model.train()
-        t0 = time.time()
         total_bias = 0
+        total_distill = 0
         total_contrastive = 0
         num_batch = 0
-
-        # ✅ tqdm progress bar for batches
-        with tqdm(total=len(train_dataloader), desc=f"[Fold {fold_idx}] Epoch {epoch_i+1}/{num_epochs}", ncols=90) as pbar:
+        
+        progress_bar = tqdm(
+            total=len(train_dataloader), 
+            desc=f"[Fold {fold_idx} on {current_device}] Epoch {epoch_i+1}/{num_epochs}", 
+            ncols=100,
+            disable=(fold_idx % args.gpu_num != 0)
+        )
+        
+        with progress_bar as pbar:
             for step, batch in enumerate(train_dataloader):
                 optimizer.zero_grad()
 
@@ -1170,16 +1166,18 @@ def train_one_fold(fold_idx, folders):
                     continue
                 
                 total_bias += bias_loss.item()
+                distill_loss = event_loss + coref_loss + temp_loss + causal_loss + sub_loss
+                total_distill += distill_loss.item()
                 total_contrastive += contrastive_loss.item()
                 num_batch += 1
 
                 try:
+                    (lambda_contrastive * contrastive_loss).backward(retain_graph=True) 
                     event_loss.backward(retain_graph=True)
                     coref_loss.backward(retain_graph=True)
                     temp_loss.backward(retain_graph=True)
                     causal_loss.backward(retain_graph=True)
                     sub_loss.backward(retain_graph=True)
-                    (lambda_contrastive * contrastive_loss).backward(retain_graph=True)
                     bias_loss.backward()
                 except RuntimeError:
                     pbar.update(1)
@@ -1189,21 +1187,25 @@ def train_one_fold(fold_idx, folders):
                 optimizer.step()
                 scheduler.step()
 
-                # ✅ update progress bar dynamically
                 pbar.set_postfix({
                     "BiasLoss": f"{bias_loss.item():.2f}",
+                    "Distill": f"{distill_loss.item():.2f}",
                     "Contrast": f"{contrastive_loss.item():.2f}"
                 })
                 pbar.update(1)
 
-        # (optional: you can save checkpoints here if needed)
-        torch.save(model.state_dict(), f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt")
+        # Save checkpoint based on dev F1
+        precision, recall, dev_f1, _, _, _ = evaluate(model, dev_dataloader)
+        
+        if dev_f1 > best_dev_f1:
+            best_dev_f1 = dev_f1
+            torch.save(model.state_dict(), f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt")
 
-    # ✅ Evaluate after training
-    model.load_state_dict(torch.load(f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt", map_location=device))
+    # Test
+    model.load_state_dict(torch.load(f"{RESULTS_DIR}/fold_{fold_idx}_best.ckpt", map_location=current_device))
     precision, recall, test_f1, macro_f1, test_dec, test_lab = evaluate(model, test_dataloader)
 
-    print(f"[Fold {fold_idx}] TEST: P={precision:.4f}, R={recall:.4f}, F1={test_f1:.4f}")
+    print(f"[Fold {fold_idx} on {current_device}] TEST: P={precision:.4f}, R={recall:.4f}, F1={test_f1:.4f}")
 
     return {
         'fold': fold_idx,
@@ -1217,18 +1219,14 @@ def train_one_fold(fold_idx, folders):
 
 # ==================== MAIN EXECUTION ====================
 
-def run_fold_on_gpu(fold_i, folders, gpu_id):
+def run_fold_on_gpu(fold_i, folders):
     """Helper for multiprocessing — runs one fold on a specified GPU"""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    torch.cuda.set_device(0)
     return train_one_fold(fold_i, folders)
 
 
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("TWO-LEVEL DUAL-VIEW WITH ADVANCED INNOVATIONS")
-    print("Innovations: Contrastive Learning, Multi-Scale Attention,")
-    print("             Adaptive Dropout, Semantic Paragraphs, Coref Links")
+    print("ABLATION 2: NO HIERARCHY (FLAT GRAPH)")
     print("="*70 + "\n")
     
     if not SEMANTIC_AVAILABLE or args.no_semantic:
@@ -1245,14 +1243,19 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     pool = mp.Pool(processes=args.gpu_num)
 
-    async_results = []
-    for fold_i in tqdm(range(args.n_folds), desc="Overall folds", ncols=80):
-        gpu_id = fold_i % args.gpu_num
-        async_results.append(pool.apply_async(run_fold_on_gpu, args=(fold_i, folders, gpu_id)))
+    pool_args = [(fold_i, folders) for fold_i in range(args.n_folds)]
+
+    all_fold_results = []
+    
+    with tqdm(total=args.n_folds, desc="Overall Folds Progress", ncols=100) as pbar:
+        for result in pool.starmap(run_fold_on_gpu, pool_args):
+            all_fold_results.append(result)
+            pbar.update(1)
+
     pool.close()
     pool.join()
-
-    all_fold_results = [res.get() for res in async_results]
+    
+    all_fold_results.sort(key=lambda x: x['fold'])
 
     # ---- AGGREGATE RESULTS ----
     precisions = [f['precision'] for f in all_fold_results]
@@ -1266,9 +1269,36 @@ if __name__ == "__main__":
     avg_f1 = np.mean(f1s)
     std_f1 = np.std(f1s)
 
+    # --- Save final results ---
+    summary = {
+        'dataset': 'BASIL' if 'BASIL' in args.data_dir else args.data_dir,
+        'n_folds': args.n_folds,
+        'n_files': len(available_files),
+        'method': 'Ablation 2: No Hierarchy (Flat Graph)',
+        'hyperparameters': {
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'max_len': args.max_len,
+            'seed': args.seed,
+            'edge_dropout': args.edge_dropout,
+            'contrastive_weight': args.contrastive_weight 
+        },
+        'aggregated_metrics': {
+            'precision': {'mean': float(avg_precision), 'std': float(std_precision)},
+            'recall': {'mean': float(avg_recall), 'std': float(std_recall)},
+            'f1': {'mean': float(avg_f1), 'std': float(std_f1)}
+        },
+        'per_fold_results': all_fold_results
+    }
+    
+    output_filename = f"{RESULTS_DIR}/final_results_ablation_2.json"
+    with open(output_filename, 'w') as f:
+        json.dump(summary, f, indent=2)
+
     print("\n" + "="*70)
-    print(f"FINAL RESULT ({args.n_folds} FOLDS)")
+    print(f"FINAL RESULT ({args.n_folds} FOLDS) - ABLATION 2")
+    print(f"Results saved to {output_filename}")
     print("="*70)
-    print(f"Precision: {avg_precision:.2f} ± {std_precision:.2f}")
-    print(f"Recall:    {avg_recall:.2f} ± {std_recall:.2f}")
-    print(f"F1:        {avg_f1:.2f} ± {std_f1:.2f}")
+    print(f"Precision: {avg_precision:.4f} ± {std_precision:.4f}")
+    print(f"Recall:    {avg_recall:.4f} ± {std_recall:.4f}")
+    print(f"F1:        {avg_f1:.4f} ± {std_f1:.4f}")
